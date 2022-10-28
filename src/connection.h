@@ -8,120 +8,80 @@
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
+ * Copyright 2014-2018, Philipp "ph3-der-loewe" Schafft <lion@lion.leolix.org>,
  */
 
 #ifndef __CONNECTION_H__
 #define __CONNECTION_H__
 
-#ifdef HAVE_WINSOCK2_H
-#include <winsock2.h>
-#endif
-
 #include <sys/types.h>
 #include <time.h>
-#ifdef HAVE_OPENSSL
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#endif
 
-struct source_tag;
-struct ice_config_tag;
-typedef struct connection_tag connection_t;
+#include "tls.h"
 
+#include "icecasttypes.h"
 #include "compat.h"
-#include "httpp/httpp.h"
-#include "net/sock.h"
+#include "common/thread/thread.h"
+#include "common/net/sock.h"
 
-extern struct _client_functions http_request_ops;
+typedef unsigned long connection_id_t;
 
-struct connection_tag
-{
-    uint64_t id;
+struct connection_tag {
+    /* Connection ID.
+     * This is uniq until it overflows (typically at least 2^32 clients).
+     */
+    connection_id_t id;
 
+    /* Timestamp of client connecting */
     time_t con_time;
-    struct {
-        time_t      time;
-        uint64_t    offset;
-    } discon;
+    /* Timestamp of when the client must be disconnected (reached listentime limit) OR 0 for no limit. */
+    time_t discon_time;
+    /* Bytes sent on this connection */
     uint64_t sent_bytes;
 
+    /* Physical socket the client is connected on */
     sock_t sock;
-    unsigned int chunk_pos; // for short writes on chunk size line
-    char error;
-    unsigned char readchk;
+    /* real and effective listen socket the connect used to connect. */
+    listensocket_t *listensocket_real;
+    listensocket_t *listensocket_effective;
 
-#ifdef HAVE_OPENSSL
-    unsigned char sslflags;
-    SSL *ssl;   /* SSL handler */
-#endif
+    /* Is the connection in an error condition? */
+    int error;
 
+    /* Current TLS mode and state of the client. */
+    tlsmode_t tlsmode;
+    tls_t *tls;
+
+    /* I/O Callbacks. Should never be called directly.
+     * Use connection_*_bytes() for I/O operations.
+     */
+    int (*send)(connection_t *handle, const void *buf, size_t len);
+    int (*read)(connection_t *handle, void *buf, size_t len);
+
+    /* Buffers for putback of data into the connection's read queue. */
+    void *readbuffer;
+    size_t readbufferlen;
+
+    /* IP Address of the client as seen by the server */
     char *ip;
 };
 
-
-struct connection_bufs
-{
-    short count, max;
-    int total;
-    IOVEC *block;
-};
-
-#ifdef WIN32
-#define IO_VECTOR_LEN(x) ((x)->len)
-#define IO_VECTOR_BASE(x) ((x)->buf)
-#else
-#define IO_VECTOR_LEN(x) ((x)->iov_len)
-#define IO_VECTOR_BASE(x) ((x)->iov_base)
-#endif
-
-#ifdef HAVE_OPENSSL
-#define not_ssl_connection(x)    ((x)->ssl==NULL)
-#else
-#define not_ssl_connection(x)    (1)
-#endif
 void connection_initialize(void);
 void connection_shutdown(void);
-void connection_thread_startup();
-void connection_thread_shutdown();
-int  connection_setup_sockets (struct ice_config_tag *config);
-void connection_reset (connection_t *con, uint64_t time_ms);
+void connection_reread_config(ice_config_t *config);
+void connection_accept_loop(void);
+void connection_setup_sockets(ice_config_t *config);
 void connection_close(connection_t *con);
-int  connection_init (connection_t *con, sock_t sock, const char *addr);
-void connection_uses_ssl (connection_t *con);
-void connection_add_banned_ip (const char *ip, int duration);
-void connection_release_banned_ip (const char *ip);
-void connection_stats (void);
+connection_t *connection_create(sock_t sock, listensocket_t *listensocket_real, listensocket_t* listensocket_effective, char *ip);
+int connection_complete_source(source_t *source, int response);
+void connection_queue(connection_t *con);
+void connection_queue_client(client_t *client);
+void connection_uses_tls(connection_t *con);
 
-void connection_bufs_init (struct connection_bufs *vectors, short start);
-void connection_bufs_release (struct connection_bufs *v);
-void connection_bufs_flush (struct connection_bufs *v);
-int  connection_bufs_append (struct connection_bufs *vectors, void *buf, unsigned int len);
-int  connection_bufs_read (connection_t *con, struct connection_bufs *vecs, int skip);
-int  connection_bufs_send (connection_t *con, struct connection_bufs *vecs, int skip);
-int  connection_unreadable (connection_t *con);
+ssize_t connection_send_bytes(connection_t *con, const void *buf, size_t len);
+ssize_t connection_read_bytes(connection_t *con, void *buf, size_t len);
+int connection_read_put_back(connection_t *con, const void *buf, size_t len);
 
-
-#define CHUNK_HDR_SZ            16
-
-int  connection_chunk_start (connection_t *con, struct connection_bufs *vecs, char *chunk_hdr, unsigned chunk_sz);
-int  connection_chunk_end (connection_t *con, struct connection_bufs *bufs, char *chunk_hdr, unsigned chunk_sz);
-
-
-#ifdef HAVE_OPENSSL
-int  connection_read_ssl (connection_t *con, void *buf, size_t len);
-int  connection_send_ssl (connection_t *con, const void *buf, size_t len);
-#endif
-int  connection_read (connection_t *con, void *buf, size_t len);
-int  connection_send (connection_t *con, const void *buf, size_t len);
-void connection_thread_shutdown_req (void);
-
-int connection_check_pass (http_parser_t *parser, const char *user, const char *pass);
-int connection_check_relay_pass(http_parser_t *parser);
-int connection_check_admin_pass(http_parser_t *parser);
-
-void connection_close_sigfd (void);
-void connection_listen_sockets_close (struct ice_config_tag *config, int all_sockets);
-
-extern int connection_running;
+extern rwlock_t _source_shutdown_rwlock;
 
 #endif  /* __CONNECTION_H__ */

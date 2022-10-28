@@ -8,13 +8,14 @@
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
+ * Copyright 2014,      Philipp "ph3-der-loewe" Schafft <lion@lion.leolix.org>,
  */
 
 /* format_ogg.h
-**
-** vorbis format plugin header
-**
-*/
+ **
+ ** vorbis format plugin header
+ **
+ */
 #ifndef __FORMAT_OGG_H__
 #define __FORMAT_OGG_H__
 
@@ -30,19 +31,13 @@ typedef struct ogg_state_tag
 
     int codec_count;
     struct ogg_codec_tag *codecs;
-    char *artist;
-    char *title;
     int log_metadata;
-    int use_url_metadata;
-    int passthrough;
-    int admin_comments_only;
     refbuf_t *file_headers;
     refbuf_t *header_pages;
     refbuf_t *header_pages_tail;
     refbuf_t **bos_end;
     int bos_completed;
     long bitrate;
-    int filter_theora;
     struct ogg_codec_tag *current;
     struct ogg_codec_tag *codec_sync;
 } ogg_state_t;
@@ -52,26 +47,23 @@ typedef struct ogg_state_tag
 typedef struct ogg_codec_tag
 {
     struct ogg_codec_tag *next;
-    ogg_state_t *parent;
     ogg_stream_state os;
     unsigned headers;
     const char *name;
-    int filtered;
     void *specific;
     refbuf_t        *possible_start;
     refbuf_t        *page;
 
-    refbuf_t *(*process)(ogg_state_t *ogg_info, struct ogg_codec_tag *codec);
+    refbuf_t *(*process)(ogg_state_t *ogg_info, struct ogg_codec_tag *codec, format_plugin_t *plugin);
     refbuf_t *(*process_page)(ogg_state_t *ogg_info,
-            struct ogg_codec_tag *codec, ogg_page *page);
+            struct ogg_codec_tag *codec, ogg_page *page, format_plugin_t *plugin);
     void (*codec_free)(ogg_state_t *ogg_info, struct ogg_codec_tag *codec);
-    int  (*get_image)(client_t *client, struct ogg_codec_tag *codec);
 } ogg_codec_t;
 
 
-refbuf_t *make_refbuf_with_page (ogg_codec_t *codec, ogg_page *page);
-void format_ogg_attach_header (ogg_codec_t *codec, ogg_page *page);
+refbuf_t *make_refbuf_with_page (ogg_page *page);
+void format_ogg_attach_header (ogg_state_t *ogg_info, ogg_page *page);
 void format_ogg_free_headers (ogg_state_t *ogg_info);
-int  format_ogg_get_plugin (format_plugin_t *plugin);
+int format_ogg_get_plugin (source_t *source);
 
 #endif  /* __FORMAT_OGG_H__ */

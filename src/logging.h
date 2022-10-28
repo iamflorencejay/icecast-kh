@@ -8,48 +8,59 @@
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
+ * Copyright 2014-2020, Philipp "ph3-der-loewe" Schafft <lion@lion.leolix.org>,
  */
 
 #ifndef __LOGGING_H__
 #define __LOGGING_H__
 
-#include "cfgfile.h"
-#include "log/log.h"
+#include "common/log/log.h"
+
+#include "icecasttypes.h"
 
 /* declare the global log descriptors */
 
 extern int errorlog;
+extern int accesslog;
+extern int playlistlog;
 
-/* these are all ERRORx and WARNx where _x_ is the number of parameters
-** it takes.  it turns out most other copmilers don't have support for
-** varargs macros.  that totally sucks, but this is still pretty easy.
-**
-** feel free to add more here if needed. 
+#ifdef _WIN32
+#include <string.h>
+#define __func__ strrchr (__FILE__, '\\') ? strrchr (__FILE__, '\\') + 1 : __FILE__
+#endif
+
+/* Log levels */
+#define ICECAST_LOGLEVEL_ERROR  1
+#define ICECAST_LOGLEVEL_WARN   2
+#define ICECAST_LOGLEVEL_INFO   3
+#define ICECAST_LOGLEVEL_DEBUG  4
+
+/* Log flags */
+#define ICECAST_LOGFLAG_NONE    0
+#define ICECAST_LOGFLAG_DEVEL   1
+
+/*
+** Variadic macros for logging
 */
 
-#define ERROR0(y) log_write(errorlog, 1, CATMODULE "/", __func__, y)
-#define ERROR1(y, a) log_write(errorlog, 1, CATMODULE "/", __func__, y, a)
-#define ERROR2(y, a, b) log_write(errorlog, 1, CATMODULE "/", __func__, y, a, b)
-#define ERROR3(y, a, b, c) log_write(errorlog, 1, CATMODULE "/", __func__, y, a, b, c)
-#define ERROR4(y, a, b, c, d) log_write(errorlog, 1, CATMODULE "/", __func__, y, a, b, c, d)
+#define ICECAST_LOG(level,flags,...) log_write(errorlog, (level), CATMODULE "/", __func__, __VA_ARGS__)
 
-#define WARN0(y) log_write(errorlog, 2, CATMODULE "/", __func__, y)
-#define WARN1(y, a) log_write(errorlog, 2, CATMODULE "/", __func__, y, a)
-#define WARN2(y, a, b) log_write(errorlog, 2, CATMODULE "/", __func__, y, a, b)
-#define WARN3(y, a, b, c) log_write(errorlog, 2, CATMODULE "/", __func__, y, a, b, c)
-#define WARN4(y, a, b, c, d) log_write(errorlog, 2, CATMODULE "/", __func__, y, a, b, c, d)
-
-#define INFO0(y) log_write(errorlog, 3, CATMODULE "/", __func__, y)
-#define INFO1(y, a) log_write(errorlog, 3, CATMODULE "/", __func__, y, a)
-#define INFO2(y, a, b) log_write(errorlog, 3, CATMODULE "/", __func__, y, a, b)
-#define INFO3(y, a, b, c) log_write(errorlog, 3, CATMODULE "/", __func__, y, a, b, c)
-#define INFO4(y, a, b, c, d) log_write(errorlog, 3, CATMODULE "/", __func__, y, a, b, c, d)
-
-#define DEBUG0(y) log_write(errorlog, 4, CATMODULE "/", __func__, y)
-#define DEBUG1(y, a) log_write(errorlog, 4, CATMODULE "/", __func__, y, a)
-#define DEBUG2(y, a, b) log_write(errorlog, 4, CATMODULE "/", __func__, y, a, b)
-#define DEBUG3(y, a, b, c) log_write(errorlog, 4, CATMODULE "/", __func__, y, a, b, c)
-#define DEBUG4(y, a, b, c, d) log_write(errorlog, 4, CATMODULE "/", __func__, y, a, b, c, d)
+#define ICECAST_LOG_ERROR(...)  ICECAST_LOG(ICECAST_LOGLEVEL_ERROR, ICECAST_LOGFLAG_NONE, __VA_ARGS__)
+#define ICECAST_LOG_WARN(...)   ICECAST_LOG(ICECAST_LOGLEVEL_WARN,  ICECAST_LOGFLAG_NONE, __VA_ARGS__)
+#define ICECAST_LOG_INFO(...)   ICECAST_LOG(ICECAST_LOGLEVEL_INFO,  ICECAST_LOGFLAG_NONE, __VA_ARGS__)
+#define ICECAST_LOG_DEBUG(...)  ICECAST_LOG(ICECAST_LOGLEVEL_DEBUG, ICECAST_LOGFLAG_NONE, __VA_ARGS__)
+/* Currently only an alias for ICECAST_LOG_DEBUG() */
+#ifdef DEVEL_LOGGING
+#define ICECAST_LOG_DERROR(...) ICECAST_LOG(ICECAST_LOGLEVEL_ERROR, ICECAST_LOGFLAG_DEVEL, __VA_ARGS__)
+#define ICECAST_LOG_DWARN(...)  ICECAST_LOG(ICECAST_LOGLEVEL_WARN,  ICECAST_LOGFLAG_DEVEL, __VA_ARGS__)
+#define ICECAST_LOG_DINFO(...)  ICECAST_LOG(ICECAST_LOGLEVEL_INFO,  ICECAST_LOGFLAG_DEVEL, __VA_ARGS__)
+#define ICECAST_LOG_DDEBUG(...) ICECAST_LOG(ICECAST_LOGLEVEL_DEBUG, ICECAST_LOGFLAG_DEVEL, __VA_ARGS__)
+#else
+#define ICECAST_LOG_DERROR(...)
+#define ICECAST_LOG_DWARN(...)
+#define ICECAST_LOG_DINFO(...)
+#define ICECAST_LOG_DDEBUG(...)
+#endif
 
 /* CATMODULE is the category or module that logging messages come from.
 ** we set one here in cause someone forgets in the .c file.
@@ -85,15 +96,12 @@ extern int errorlog;
 
 #define LOGGING_FORMAT_CLF "%d/%b/%Y:%H:%M:%S %z"
 
-void logging_access_id (struct access_log *accesslog, client_t *client);
+int logging_str2logid(const char *str);
+
 void logging_access(client_t *client);
 void logging_playlist(const char *mount, const char *metadata, long listeners);
-void logging_preroll (int log_id, const char *intro_name, client_t *client);
-int  restart_logging (ice_config_t *config);
-int init_logging (ice_config_t *config);
-int  start_logging(ice_config_t *config);
-void stop_logging(void);
+void logging_mark(const char *username, const char *role);
+void restart_logging (ice_config_t *config);
 void log_parse_failure (void *ctx, const char *fmt, ...);
 
 #endif  /* __LOGGING_H__ */
-

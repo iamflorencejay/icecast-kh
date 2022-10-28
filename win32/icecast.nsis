@@ -1,123 +1,212 @@
-#!Nsis Installer Command Script
-#
-# This is an NSIS Installer Command Script generated automatically
-# by the Fedora nsiswrapper program.  For more information see:
-#
-#   http://fedoraproject.org/wiki/MinGW
-#
-# To build an installer from the script you would normally do:
-#
-#   makensis this_script
-#
-# which will generate the output file 'installer.exe' which is a Windows
-# installer containing your program.
+;NSIS based Icecast Installer
+;Written by Thomas B. Rücker
+;Initial version written by Stephan Jauernick
+;Based on "Start Menu Folder Selection Example Script" by Joost Verburg
 
-Name "Icecast KH"
-OutFile "icecast-2.4.0-kh15_win32_setup.exe"
+;--------------------------------
+;Includes
 
-InstallDir "$ProgramFiles\Icecast KH"
-InstallDirRegKey HKLM SOFTWARE\Icecast "Install_Dir"
+; Modern UI
+  !include "MUI2.nsh"
 
-LoadLanguageFile "${NSISDIR}\Contrib\Language files\English.nlf"
+;File functions
+  !include "FileFunc.nsh"
 
-ShowInstDetails hide
-ShowUninstDetails hide
+;--------------------------------
+;General
 
-# Uncomment this to enable BZip2 compression, which results in
-# slightly smaller files but uses more memory at install time.
-SetCompressor bzip2
+  ;Name and file
+  Name "Icecast"
+  OutFile "icecast_win32_2.5-beta3.exe"
 
-XPStyle on
+  ;Default installation folder
+  InstallDir "$PROGRAMFILES32\Icecast"
 
-;Version Information
+  ;Get installation folder from registry if available
+  InstallDirRegKey HKCU "Software\Xiph.org\Icecast" ""
 
-VIProductVersion "2.4.0.15"
-VIAddVersionKey /LANG=${LANG_ENGLISH} "ProductName" "Icecast KH"
-VIAddVersionKey /LANG=${LANG_ENGLISH} "ProductVersion" "2.4.0"
-VIAddVersionKey /LANG=${LANG_ENGLISH} "LegalCopyright" "Karl Heyes @2000-2020"
-VIAddVersionKey /LANG=${LANG_ENGLISH} "FileDescription" "Icecast KH streaming media server installer"
-VIAddVersionKey /LANG=${LANG_ENGLISH} "FileVersion" "2.4.0-KH15"
+  ;Request application privileges for Windows Vista
+  RequestExecutionLevel admin
 
-Page components
-Page directory
-Page instfiles
+  ;Installer icon
+  !define MUI_ICON "bin/icecast.ico"
+  !define MUI_HEADERIMAGE
+  !define MUI_HEADERIMAGE_BITMAP "icecast2logo3.bmp"
+  !define MUI_HEADERIMAGE_RIGHT
 
-ComponentText "Select which optional components you want to install."
+  !define /date BUILDTIMESTAMP "%Y-%m-%dT%H:%M:%S+%z"
 
-DirText "Please select the installation folder."
+;--------------------------------
+;Variables
 
-Function un.onInit
-    MessageBox MB_YESNO "Uninstall icecast KH from $INSTDIR ?" IDYES NoAbort
-      Abort ; causes uninstaller to quit.
-    NoAbort:
-FunctionEnd
+  Var RegistryPathForUninstall
+  Var StartMenuFolder
+  Var EstimatedSize
+  Var Day
+  Var Month
+  Var Year
+  Var DoW
+  Var Hour
+  Var Minute
+  Var Second
 
-Section "Icecast Installation"
-  SectionIn RO
+;--------------------------------
+; Create URL file macro
+
+  !macro CreateInternetShortcut FILENAME URL ICONFILE ICONINDEX
+  WriteINIStr "${FILENAME}.url" "InternetShortcut" "URL" "${URL}"
+  WriteINIStr "${FILENAME}.url" "InternetShortcut" "IconFile" "${ICONFILE}"
+  WriteINIStr "${FILENAME}.url" "InternetShortcut" "IconIndex" "${ICONINDEX}"
+  !macroend
+
+;--------------------------------
+;Interface Settings
+
+  !define MUI_ABORTWARNING
+
+;--------------------------------
+;Pages
+
+  !insertmacro MUI_PAGE_LICENSE doc/COPYING
+  !insertmacro MUI_PAGE_COMPONENTS
+  !insertmacro MUI_PAGE_DIRECTORY
+
+  ;Start Menu Folder Page Configuration
+  !define MUI_STARTMENUPAGE_REGISTRY_ROOT "HKCU"
+  !define MUI_STARTMENUPAGE_REGISTRY_KEY "Software\Xiph.org\Icecast"
+  !define MUI_STARTMENUPAGE_REGISTRY_VALUENAME "Start Menu Folder"
+
+  !insertmacro MUI_PAGE_STARTMENU Application $StartMenuFolder
+
+  !insertmacro MUI_PAGE_INSTFILES
+
+  !insertmacro MUI_UNPAGE_CONFIRM
+  !insertmacro MUI_UNPAGE_INSTFILES
+
+;--------------------------------
+;Languages
+
+  !insertmacro MUI_LANGUAGE "English"
+
+;--------------------------------
+;Installer Sections
+
+Section "Icecast" SecIcecastWin32
+
+  ;Image - not supported on non-win32 builds
+  ;AddBrandingImage left 175 32
+  ;SetBrandingImage "icecast2logo2.bmp"
 
   SetOutPath "$INSTDIR"
-  File /r "x32/*.dll"
 
+  ;ADD YOUR OWN FILES HERE...
+
+  File /r "bin"
+  File /r "doc"
+  File /r "web"
+  File /r "admin"
+  File "mime.types"
+  File "icecast.bat"
+  ;OMG my eyes, why is Goto inherent
+  IfFileExists "$INSTDIR\icecast.xml" config_exists config_nonexistent
+  config_exists:
+    Goto config_done
+  config_nonexistent:
+    File "icecast.xml"
+  config_done:
+
+  ;Store installation folder
+  WriteRegStr HKCU "Software\Xiph.org\Icecast" "" $INSTDIR
+
+  ;Determine installed size (will include all files, even user placed in $INSTDIR!)
+  ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+  IntFmt $EstimatedSize "0x%08X" $0
+
+  ${GetTime} "" "LS" $Day $Month $Year $DoW $Hour $Minute $Second
+
+  ;Registry path for Windows uninstaller and software management
+  StrCpy $RegistryPathForUninstall "Software\Microsoft\Windows\CurrentVersion\Uninstall\Xiph.org-Icecast"
+
+  ;Create uninstaller
   WriteUninstaller "$INSTDIR\Uninstall.exe"
+  WriteRegDWORD HKLM $RegistryPathForUninstall "EstimatedSize" "$EstimatedSize"
+  WriteRegStr   HKLM $RegistryPathForUninstall "DisplayName" "Icecast"
+  WriteRegStr   HKLM $RegistryPathForUninstall "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
+  WriteRegStr   HKLM $RegistryPathForUninstall "DisplayIcon" "$INSTDIR\bin\icecast.ico"
+  WriteRegStr   HKLM $RegistryPathForUninstall "Publisher" "Xiph.org Foundation / The Icecast Project"
+  WriteRegStr   HKLM $RegistryPathForUninstall "HelpLink" "http://icecast.org/contact"
+  WriteRegStr   HKLM $RegistryPathForUninstall "URLInfoAbout" "http://icecast.org/"
+  WriteRegStr   HKLM $RegistryPathForUninstall "DisplayVersion" "2.5 beta3"
+  WriteRegStr   HKLM $RegistryPathForUninstall "InstallLocation" "$INSTDIR"
+  WriteRegStr   HKLM $RegistryPathForUninstall "InstallDate" "$Year$Month$Day"
+  WriteRegDWORD HKLM $RegistryPathForUninstall "NoModify" 0x1
+  WriteRegDWORD HKLM $RegistryPathForUninstall "NoRepair" 0x1
+  WriteRegDWORD HKLM $RegistryPathForUninstall "VersionMajor" 0x2
+  WriteRegDWORD HKLM $RegistryPathForUninstall "VersionMinor" 0x4
+  WriteRegDWORD HKLM $RegistryPathForUninstall "VersionServicePack" 0x63
+  ;WriteRegStr HKLM "$RegistryPathForUninstall "" ""
 
-  File "x32/icecast.exe"
-  SetOverwrite off
-  File "x32/icecast.xml"
-  SetOverwrite on
 
-  SetOutPath "$INSTDIR\logs"
-  File /r "x64/logs/"
+  !insertmacro MUI_STARTMENU_WRITE_BEGIN Application
 
-  SetOutPath "$INSTDIR\admin"
-  File /r "x64/admin/"
+    ;Create shortcuts
+    CreateDirectory "$SMPROGRAMS\$StartMenuFolder"
+    CreateShortcut "$SMPROGRAMS\$StartMenuFolder\Run Icecast (Console).lnk" "$INSTDIR\icecast.bat" "" "$INSTDIR\bin\icecast.ico" "" "" "" "Icecast (Starts in a console window)"
+    CreateShortcut "$SMPROGRAMS\$StartMenuFolder\Icecast Config.lnk" "%SystemRoot%\system32\notepad.exe" "$INSTDIR\icecast.xml" "" "" "" "" "Open Icecast config for editing in Notepad"
+    !insertmacro CreateInternetShortcut "$SMPROGRAMS\$StartMenuFolder\Icecast web status (public)" "http://127.0.0.1:8000/" "$INSTDIR\bin\icecast.ico" "0"
+    !insertmacro CreateInternetShortcut "$SMPROGRAMS\$StartMenuFolder\Icecast web admin interface" "http://127.0.0.1:8000/admin/" "$INSTDIR\bin\icecast.ico" "0"
+    CreateShortcut "$SMPROGRAMS\$StartMenuFolder\Icecast documentation.lnk" "$INSTDIR\doc\index.html"
 
-  SetOutPath "$INSTDIR\doc"
-  File /r "x64/doc/"
+  !insertmacro MUI_STARTMENU_WRITE_END
 
-  SetOutPath "$INSTDIR\web"
-  File /r "x64/web/"
+  ;Create logging directory
+  CreateDirectory "$INSTDIR\log"
 
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Icecast KH" \
-                 "DisplayName" "Icecast KH"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Icecast KH" \
-                 "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
 SectionEnd
 
-Section "Install Service"
-  SetOutPath "$INSTDIR"
-  ExecWait '"$INSTDIR\icecast.exe" "install" "$INSTDIR"'
-SectionEnd
+;--------------------------------
+;Descriptions
 
-Section "Start Menu Shortcuts"
-  CreateDirectory "$SMPROGRAMS\Icecast KH"
-  SetOutPath "$INSTDIR"
-  CreateShortCut "$SMPROGRAMS\Icecast KH\Edit Configuration.lnk" "notepad.exe" "$INSTDIR\icecast.xml"
-  CreateShortCut "$SMPROGRAMS\Icecast KH\Uninstall Icecast.lnk" "$INSTDIR\Uninstall.exe" "" "$INSTDIR\Uninstall.exe" 0
-  CreateShortCut "$SMPROGRAMS\Icecast KH\Run Icecast.lnk" "$INSTDIR\icecast.exe" '-c "$INSTDIR\icecast.xml"'
-SectionEnd
+  ;Language strings
+  LangString DESC_SecIcecastWin32 ${LANG_ENGLISH} "Icecast for win32 with all required files and libraries"
 
-Section "Desktop Icons"
-  SetOutPath "$INSTDIR"
-  CreateShortCut "$DESKTOP\Icecast.lnk" "$INSTDIR\icecast.exe" '-c "$INSTDIR\icecast.xml"'
-SectionEnd
+  ;Assign language strings to sections
+  !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
+    !insertmacro MUI_DESCRIPTION_TEXT ${SecIcecastWin32} $(DESC_SecIcecastWin32)
+  !insertmacro MUI_FUNCTION_DESCRIPTION_END
+
+;--------------------------------
+;Uninstaller Section
 
 Section "Uninstall"
-  ExecWait '"$INSTDIR\icecast.exe" "remove"'
-  Delete $INSTDIR\Uninstall.exe
-  Delete /rebootok "$DESKTOP\Icecast.lnk"
-  Delete /rebootok "$SMPROGRAMS\Icecast KH\Run Icecast.lnk"
-  Delete /rebootok "$SMPROGRAMS\Icecast KH\Uninstall Icecast.lnk"
-  Delete /rebootok "$SMPROGRAMS\Icecast KH\Edit Configuration.lnk"
-  RMDir "$SMPROGRAMS\Icecast KH"
 
-  RMDir /r "$INSTDIR\web"
+  ;ADD YOUR OWN FILES HERE...
+  RMDir /r "$INSTDIR\bin"
   RMDir /r "$INSTDIR\doc"
-  RMDir /r "$INSTDIR\admin"
+  Delete "$INSTDIR\mime.types"
+  Delete "$INSTDIR\icecast.bat"
 
-  Delete /rebootok "$INSTDIR\icecast.exe"
-
-  Delete /rebootok "$INSTDIR\*.dll"
+  Delete "$INSTDIR\Uninstall.exe"
 
   RMDir "$INSTDIR"
-  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Icecast KH"
+
+  !insertmacro MUI_STARTMENU_GETFOLDER Application $StartMenuFolder
+
+  Delete "$SMPROGRAMS\$StartMenuFolder\Run Icecast (Console).lnk"
+  Delete "$SMPROGRAMS\$StartMenuFolder\Icecast Config.lnk"
+  Delete "$SMPROGRAMS\$StartMenuFolder\Icecast documentation.lnk"
+  Delete "$SMPROGRAMS\$StartMenuFolder\Icecast web status (public).url"
+  Delete "$SMPROGRAMS\$StartMenuFolder\Icecast web admin interface.url"
+  RMDir "$SMPROGRAMS\$StartMenuFolder"
+
+  ;Registry path for Windows uninstaller and software management
+  StrCpy $RegistryPathForUninstall "Software\Microsoft\Windows\CurrentVersion\Uninstall\Xiph.org-Icecast"
+  DeleteRegKey HKLM "$RegistryPathForUninstall"
+
+  ;DeleteRegKey /ifempty HKCU "Software\Xiph.org\Icecast"
+
 SectionEnd
+
+Function .onInit
+  SectionSetFlags ${SecIcecastWin32} 17
+FunctionEnd

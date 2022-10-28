@@ -1,110 +1,107 @@
-<xsl:stylesheet xmlns:xsl = "http://www.w3.org/1999/XSL/Transform" version = "1.0" >
-<xsl:output method="xml" media-type="text/html" indent="yes" encoding="UTF-8"
-    doctype-system="http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"
-    doctype-public="-//W3C//DTD XHTML 1.0 Transitional//EN" />
+<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="1.0">
+    <!-- Import include files -->
+    <xsl:include href="includes/page.xsl"/>
+    <xsl:include href="includes/mountnav.xsl"/>
+    <xsl:include href="includes/player.xsl"/>
+    <xsl:include href="includes/playlist.xsl"/>
+    <xsl:include href="includes/authlist.xsl"/>
 
-<xsl:template match = "/icestats" >
-<html>
-<head>
-<title>Icecast Streaming Media Server</title>
-<link rel="stylesheet" type="text/css" href="/style.css" />
-</head>
-<body bgcolor="#000" topmargin="0" leftmargin="0" rightmargin="0" bottommargin="0">
+    <xsl:param name="param-showall" />
+    <xsl:param name="param-has-mount" />
+    <xsl:variable name="title">Server status</xsl:variable>
 
-<div class="main">
+    <xsl:template name="content">
+        <h2>Server status</h2>
 
-<br />
+        <!-- Global stats table -->
+        <section class="box">
+            <h3 class="box_title">Global server stats</h3>
+            <!-- Global subnav -->
+            <div class="stats">
+                <ul class="boxnav">
+                    <li><a href="/admin/reloadconfig.xsl?omode=normal">Reload Configuration</a></li>
+                    <li><a href="/admin/stats.xsl?showall=true">Show all mounts</a></li>
+                </ul>
+            </div>
 
-<!--global server stats-->
-<div class="roundcont">
-<div class="roundtop">
-<img src="/images/corner_topleft.jpg" class="corner" style="display: none" />
-</div>
-<div class="newscontent">
-<h3>Global Server Stats</h3>
-<table border="0" cellpadding="4">
-<xsl:for-each select="/icestats">
-<xsl:for-each select="*">
-<xsl:if test = "name()!='source'"> 
-<tr>
-	<td width="130"><xsl:value-of select="name()" /></td>
-	<td class="streamdata"><xsl:value-of select="." /></td>
-</tr>
-</xsl:if>
-</xsl:for-each>
-</xsl:for-each>
-</table>
-</div>
-<div class="roundbottom">
-<img src="/images/corner_bottomleft.jpg" class="corner" style="display: none" />
-</div>
-</div>
-<br />
-<br />
-<!--end global server stats-->
+            <h4>Statistics</h4>
 
-<!--mount point stats-->
-<xsl:for-each select="source">
-<div class="roundcont">
-<div class="roundtop">
-<img src="/images/corner_topleft.jpg" class="corner" style="display: none" />
-</div>
-<div class="newscontent">
-<div class="streamheader">
-    <table cellspacing="0" cellpadding="0">
-        <colgroup align="left" />
-        <colgroup align="right" width="300" />
-        <tr>
-            <td><h3>Mount Point <xsl:value-of select="@mount" /></h3></td>
-            <xsl:choose>
-                <xsl:when test="authenticator">
-                    <td align="right"><a class="auth" href="/auth.xsl">Login</a></td>
-                </xsl:when>
-                <xsl:otherwise>
-                    <td align="right"> <a href="{@mount}.m3u">M3U</a> <a href="{@mount}.xspf">XSPF</a></td>
-                </xsl:otherwise>
-            </xsl:choose>
-    </tr></table>
-</div>
+            <table class="table-block">
+                <thead>
+                    <tr>
+                        <th>Key</th>
+                        <th>Value</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <xsl:for-each select="/icestats/*[not(self::source) and not(self::authentication) and not(self::modules)]">
+                        <tr>
+                            <td><xsl:value-of select="name()" /></td>
+                            <td><xsl:value-of select="text()" /></td>
+                        </tr>
+                    </xsl:for-each>
+                </tbody>
+            </table>
 
-	<table border="0" cellpadding="1" cellspacing="5" bgcolor="444444">
-	<tr>        
-	    <td align="center">
-		    <a class="nav2" href="listclients.xsl?mount={@mount}">List Clients</a>
-        	<a class="nav2" href="moveclients.xsl?mount={@mount}">Move Listeners</a>
-        	<a class="nav2" href="updatemetadata.xsl?mount={@mount}">Update Metadata</a>
-        	<a class="nav2" href="killsource.xsl?mount={@mount}">Kill Source</a>
-                <xsl:if test="authenticator"><a class="nav2" href="manageauth.xsl?mount={@mount}">Manage Authentication</a></xsl:if>
-	    </td></tr>
-	</table>
-<br />
-<table cellpadding="5" cellspacing="0" border="0">
-	<xsl:for-each select="*">
-    <xsl:choose>
-    <xsl:when test="name()='listener'"></xsl:when>
-    <xsl:otherwise>
-	<tr>
-		<td width="130"><xsl:value-of select="name()" /></td>
-		<td class="streamdata"><xsl:value-of select="." /></td>
-	</tr>
-    </xsl:otherwise>
-    </xsl:choose>
-	</xsl:for-each>
-</table>
-</div>
-<div class="roundbottom">
-<img src="/images/corner_bottomleft.jpg" class="corner" style="display: none" />
-</div>
-</div>
-<br />
-<br />
-</xsl:for-each>
-<xsl:text disable-output-escaping="yes">&amp;</xsl:text>nbsp;
+            <!-- Global Auth -->
+            <xsl:if test="authentication">
+                <h4>Authentication</h4>
+                <xsl:call-template name="authlist" />
+            </xsl:if>
+        </section>
 
-<!--end mount point stats-->
-<div class="poster">Support icecast development at <a class="nav" href="http://www.icecast.org">www.icecast.org</a></div>
-</div>
-</body>
-</html>
-</xsl:template>
+        <!-- Mount stats -->
+        <xsl:if test="$param-showall or $param-has-mount">
+            <xsl:for-each select="source">
+                <section class="box" id="mount-{position()}">
+                    <h3 class="box_title">Mountpoint <code><xsl:value-of select="@mount" /></code></h3>
+                    <!-- Mount nav -->
+                    <xsl:call-template name="mountnav" />
+                    <xsl:call-template name="player" />
+                    <h4>Further information</h4>
+                    <table class="table-block">
+                        <thead>
+                            <tr>
+                                <th>Key</th>
+                                <th>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <xsl:for-each select="*[not(self::metadata) and not(self::authentication) and not(self::authenticator) and not(self::listener)]">
+                                <tr>
+                                    <td><xsl:value-of select="name()" /></td>
+                                    <td><xsl:value-of select="text()" /></td>
+                                </tr>
+                            </xsl:for-each>
+                        </tbody>
+                    </table>
+
+                    <!-- Extra metadata -->
+                    <xsl:if test="metadata/*">
+                        <h4>Extra Metadata</h4>
+                        <table class="table-block">
+                            <tbody>
+                                <xsl:for-each select="metadata/*">
+                                    <tr>
+                                        <td><xsl:value-of select="name()" /></td>
+                                        <td><xsl:value-of select="text()" /></td>
+                                    </tr>
+                                </xsl:for-each>
+                            </tbody>
+                        </table>
+                    </xsl:if>
+
+                    <!-- Extra playlist -->
+                    <xsl:call-template name="playlist" />
+
+                    <!-- Mount Authentication -->
+                    <xsl:if test="authentication/*">
+                        <h4>Mount Authentication</h4>
+                        <xsl:call-template name="authlist" />
+                    </xsl:if>
+
+                </section>
+            </xsl:for-each>
+        </xsl:if>
+    </xsl:template>
 </xsl:stylesheet>

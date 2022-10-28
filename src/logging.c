@@ -3,134 +3,199 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
+ * Copyright 2011-2020, Philipp "ph3-der-loewe" Schafft <lion@lion.leolix.org>,
  */
 
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
 
-#include "compat.h"
 #include <stdio.h>
+#include <time.h>
 #include <string.h>
 
-#include "thread/thread.h"
-#include "httpp/httpp.h"
+#include "common/thread/thread.h"
+#include "common/httpp/httpp.h"
 
+#include "logging.h"
 #include "connection.h"
 #include "refbuf.h"
 #include "client.h"
 
+#include "compat.h"
 #include "cfgfile.h"
-#include "logging.h"
 #include "util.h"
-#include "errno.h"
-#include "global.h"
 
 #define CATMODULE "logging"
 
-void fatal_error (const char *perr);
+#ifdef _WIN32
+#define snprintf _snprintf
+#define vsnprintf _vsnprintf
+#endif
 
 /* the global log descriptors */
 int errorlog = 0;
+int accesslog = 0;
 int playlistlog = 0;
 
-/* 
-** ADDR IDENT USER DATE REQUEST CODE BYTES REFERER AGENT [TIME]
-**
-** ADDR = client->con->ip
-** IDENT = always - , we don't support it because it's useless
-** USER = client->username
-** DATE = _make_date(client->con->con_time)
-** REQUEST = build from client->parser
-** CODE = client->respcode
-** BYTES = client->con->sent_bytes
-** REFERER = get from client->parser
-** AGENT = get from client->parser
-** TIME = timing_get_time() - client->con->con_time
-*/
-void logging_access_id (access_log *accesslog, client_t *client)
+int logging_str2logid(const char *str)
 {
-    const char *req = NULL;
-    time_t now;
-    time_t stayed;
-    const char *referrer, *user_agent, *ip = "-";
-    char *username, datebuf[50];
-    char reqbuf[256];
+    if (!str)
+        return -1;
 
-    if (client->flags & CLIENT_SKIP_ACCESSLOG)
-        return;
+    if (!strcmp(str, "error")) {
+        return errorlog;
+    } else if (!strcmp(str, "access")) {
+        return accesslog;
+    } else if (!strcmp(str, "playlist")) {
+        return playlistlog;
+    }
+
+    return -1;
+}
+
+
+#ifdef _WIN32
+/* Since strftime's %z option on win32 is different, we need
+ to go through a few loops to get the same info as %z */
+int get_clf_time (char *buffer, unsigned len, struct tm *t)
+{
+    char sign;
+    char timezone_string[7];
+    struct tm gmt;
+    time_t time1 = time(NULL);
+    int time_days, time_hours, time_tz;
+    int tempnum1, tempnum2;
+    struct tm *thetime;
+    time_t now;
+
+#if !defined(_WIN32)
+    thetime = gmtime_r(&time1, &gmt)
+#else
+    /* gmtime() on W32 breaks POSIX and IS thread-safe (uses TLS) */
+    thetime = gmtime (&time1);
+    if (thetime)
+      memcpy (&gmt, thetime, sizeof (gmt));
+#endif
+    /* FIXME: bail out if gmtime* returns NULL */
+
+    if (!thetime) {
+        snprintf(buffer, len, "<<BAD TIMESTAMP>>");
+        return 0;
+    }
+
+    time_days = t->tm_yday - gmt.tm_yday;
+
+    if (time_days < -1) {
+        tempnum1 = 24;
+    }
+    else {
+        tempnum1 = 1;
+    }
+    if (tempnum1 < time_days) {
+       tempnum2 = -24;
+    }
+    else {
+        tempnum2 = time_days*24;
+    }
+
+    time_hours = (tempnum2 + t->tm_hour - gmt.tm_hour);
+    time_tz = time_hours * 60 + t->tm_min - gmt.tm_min;
+
+    if (time_tz < 0) {
+        sign = '-';
+        time_tz = -time_tz;
+    }
+    else {
+        sign = '+';
+    }
+
+    snprintf(timezone_string, sizeof(timezone_string), " %c%.2d%.2d", sign, time_tz / 60, time_tz % 60);
 
     now = time(NULL);
 
-    /* build the data */
-    util_get_clf_time (datebuf, sizeof(datebuf), now);
-    if (accesslog->qstr)
-        req = httpp_getvar (client->parser, HTTPP_VAR_RAWURI);
-    if (req == NULL)
-        req = httpp_getvar (client->parser, HTTPP_VAR_URI);
-    /* build the request */
-    snprintf (reqbuf, sizeof(reqbuf), "%.10s %.235s %.5s/%s",
-            httpp_getvar (client->parser, HTTPP_VAR_REQ_TYPE), req,
-            httpp_getvar (client->parser, HTTPP_VAR_PROTOCOL),
-            httpp_getvar (client->parser, HTTPP_VAR_VERSION));
-
-    stayed = (client->connection.con_time > now) ? 0 : (now - client->connection.con_time); // in case the clock has shifted
-    username = (client->username && client->username[0]) ? util_url_escape (client->username) : strdup("-");
-    referrer = httpp_getvar (client->parser, "referer");
-    user_agent = httpp_getvar (client->parser, "user-agent");
-
-    if (accesslog->log_ip)
-        ip = client->connection.ip;
-
-    if (accesslog->type == LOG_ACCESS_CLF_ESC)
-    {
-        char *rq = util_url_escape (reqbuf),
-             *rf = referrer ? util_url_escape (referrer) : strdup ("-"),
-             *ua = user_agent ? util_url_escape (user_agent) : strdup ("-");
-
-        log_write_direct (accesslog->logid,
-                "%s - %s %s %s %d %" PRIu64 " %.150s %.150s %lu",
-                ip, username, datebuf, rq, client->respcode, client->connection.sent_bytes,
-                rf, ua, (unsigned long)stayed);
-        free (ua);
-        free (rf);
-        free (rq);
-    }
-    else
-    {
-        if (referrer == NULL)           referrer = "-";
-        if (user_agent == NULL)         user_agent = "-";
-
-        log_write_direct (accesslog->logid,
-                "%s - %s [%s] \"%s\" %d %" PRIu64 " \"%.150s\" \"%.150s\" %lu",
-                ip, username, datebuf, reqbuf, client->respcode, client->connection.sent_bytes,
-                referrer, user_agent, (unsigned long)stayed);
-    }
-    free (username);
-    client->respcode = -1;
+    thetime = localtime(&now);
+    strftime(buffer, len - sizeof(timezone_string), "%d/%b/%Y:%H:%M:%S", thetime);
+    strcat(buffer, timezone_string);
+    return 1;
 }
-
-
-void logging_access (client_t *client)
+#endif
+/*
+ ** ADDR IDENT USER DATE REQUEST CODE BYTES REFERER AGENT [TIME]
+ **
+ ** ADDR = client->con->ip
+ ** IDENT = always - , we don't support it because it's useless
+ ** USER = client->username
+ ** DATE = _make_date(client->con->con_time)
+ ** REQUEST = build from client->parser
+ ** CODE = client->respcode
+ ** BYTES = client->con->sent_bytes
+ ** REFERER = get from client->parser
+ ** AGENT = get from client->parser
+ ** TIME = timing_get_time() - client->con->con_time
+ */
+void logging_access(client_t *client)
 {
-    ice_config_t *config = config_get_config();
-    logging_access_id (&config->access_log, client);
-    config_release_config ();
+    char datebuf[128];
+    struct tm thetime;
+    time_t now;
+    time_t stayed;
+    const char *referrer, *user_agent, *username;
+
+    now = time(NULL);
+
+    localtime_r (&now, &thetime);
+    /* build the data */
+#ifdef _WIN32
+    memset(datebuf, '\000', sizeof(datebuf));
+    get_clf_time(datebuf, sizeof(datebuf)-1, &thetime);
+#else
+    strftime (datebuf, sizeof(datebuf), LOGGING_FORMAT_CLF, &thetime);
+#endif
+
+    stayed = now - client->con->con_time;
+
+    if (client->username == NULL)
+        username = "-";
+    else
+        username = client->username;
+
+    referrer = httpp_getvar (client->parser, "referer");
+    if (referrer == NULL)
+        referrer = "-";
+
+    user_agent = httpp_getvar (client->parser, "user-agent");
+    if (user_agent == NULL)
+        user_agent = "-";
+
+    log_write_direct (accesslog,
+            "%s - %H [%s] \"%H %H %H/%H\" %d %llu \"% H\" \"% H\" %llu",
+            client->con->ip,
+            username,
+            datebuf,
+            httpp_getvar (client->parser, HTTPP_VAR_REQ_TYPE),
+            httpp_getvar (client->parser, HTTPP_VAR_URI),
+            httpp_getvar (client->parser, HTTPP_VAR_PROTOCOL),
+            httpp_getvar (client->parser, HTTPP_VAR_VERSION),
+            client->respcode,
+            (long long unsigned int)client->con->sent_bytes,
+            referrer,
+            user_agent,
+            (long long unsigned int)stayed);
 }
-
-
 /* This function will provide a log of metadata for each
    mountpoint.  The metadata *must* be in UTF-8, and thus
    you can assume that the log itself is UTF-8 encoded */
 void logging_playlist(const char *mount, const char *metadata, long listeners)
 {
-    time_t now;
     char datebuf[128];
+    struct tm thetime;
+    time_t now;
 
     if (playlistlog == -1) {
         return;
@@ -138,7 +203,14 @@ void logging_playlist(const char *mount, const char *metadata, long listeners)
 
     now = time(NULL);
 
-    util_get_clf_time (datebuf, sizeof(datebuf), now);
+    localtime_r (&now, &thetime);
+    /* build the data */
+#ifdef _WIN32
+    memset(datebuf, '\000', sizeof(datebuf));
+    get_clf_time(datebuf, sizeof(datebuf)-1, &thetime);
+#else
+    strftime (datebuf, sizeof(datebuf), LOGGING_FORMAT_CLF, &thetime);
+#endif
     /* This format MAY CHANGE OVER TIME.  We are looking into finding a good
        standard format for this, if you have any ideas, please let us know */
     log_write_direct (playlistlog, "%s|%s|%ld|%s",
@@ -148,18 +220,11 @@ void logging_playlist(const char *mount, const char *metadata, long listeners)
              metadata);
 }
 
-
-void logging_preroll (int log_id, const char *intro_name, client_t *client)
+void logging_mark(const char *username, const char *role)
 {
-    char datebuf[128];
-
-    util_get_clf_time (datebuf, sizeof(datebuf), client->worker->current_time.tv_sec);
-
-    log_write_direct (log_id, "%s|%s|%" PRIu64 "|%s|%ld|%s",
-             datebuf, client->mount, client->connection.id,
-             &client->connection.ip[0], (long)client->intro_offset, intro_name);
+    ICECAST_LOG_INFO("######## -- MARK -- (requested by %#H with role %#H) ########", username, role);
+    logging_playlist("/admin/", "-- MARK --", 0);
 }
-
 
 void log_parse_failure (void *ctx, const char *fmt, ...)
 {
@@ -172,161 +237,44 @@ void log_parse_failure (void *ctx, const char *fmt, ...)
     eol = strrchr (line, '\n');
     if (eol) *eol='\0';
     va_end (ap);
-    log_write (errorlog, 2, "xml/", "parsing", "%s", line);
+    log_write (errorlog, 2, (char*)ctx, "", "%s", line);
 }
 
 
-static int recheck_log_file (ice_config_t *config, int *id, const char *file)
+void restart_logging (ice_config_t *config)
 {
-    char fn [FILENAME_MAX] = "";
+    if (strcmp (config->error_log, "-"))
+    {
+        char fn_error[FILENAME_MAX];
+        snprintf (fn_error, FILENAME_MAX, "%s%s%s", config->log_dir, PATH_SEPARATOR, config->error_log);
+        log_set_filename (errorlog, fn_error);
+        log_set_level (errorlog, config->loglevel);
+        log_set_trigger (errorlog, config->logsize);
+        log_set_archive_timestamp(errorlog, config->logarchive);
+        log_reopen (errorlog);
+    }
 
-    if (file == NULL)
+    if (strcmp (config->access_log, "-"))
     {
-        log_close (*id);
-        *id = -1;
-        return 0;
+        char fn_error[FILENAME_MAX];
+        snprintf (fn_error, FILENAME_MAX, "%s%s%s", config->log_dir, PATH_SEPARATOR, config->access_log);
+        log_set_filename (accesslog, fn_error);
+        log_set_trigger (accesslog, config->logsize);
+        log_set_archive_timestamp (accesslog, config->logarchive);
+        log_reopen (accesslog);
     }
-    if (strcmp (file, "-") != 0)
-        snprintf (fn, FILENAME_MAX, "%s%s%s", config->log_dir, PATH_SEPARATOR, file);
-    if (*id < 0)
+
+    if (config->playlist_log)
     {
-        *id = log_open (fn);
-        if (*id < 0)
-        {
-            char buf[1024];
-            snprintf (buf,1024, "could not open log %.300s: %s", fn, strerror(errno));
-            fatal_error (buf);
-            return -1;
-        }
-        INFO1 ("Using log file %s", fn);
-        return 0;
+        char fn_error[FILENAME_MAX];
+        snprintf (fn_error, FILENAME_MAX, "%s%s%s", config->log_dir, PATH_SEPARATOR, config->playlist_log);
+        log_set_filename (playlistlog, fn_error);
+        log_set_trigger (playlistlog, config->logsize);
+        log_set_archive_timestamp (playlistlog, config->logarchive);
+        log_reopen (playlistlog);
     }
-    log_set_filename (*id, fn);
-    log_reopen (*id);
-    return 0;
+
+    log_set_lines_kept(errorlog, config->error_log_lines_kept);
+    log_set_lines_kept(accesslog, config->access_log_lines_kept);
+    log_set_lines_kept(playlistlog, config->playlist_log_lines_kept);
 }
-
-
-static int recheck_access_log (ice_config_t *config, struct access_log *access)
-{
-    if (recheck_log_file (config, &access->logid, access->name) < 0)
-        return -1;
-    if (access->logid == -1)
-        return 0; // closed
-    long max_size = (access->size > 10000) ? access->size : config->access_log.size;
-    log_set_trigger (access->logid, max_size);
-    log_set_reopen_after (access->logid, access->duration);
-    if (access->display > 0)
-        log_set_lines_kept (access->logid, access->display);
-    int archive = (access->archive == -1) ? config->access_log.archive : access->archive;
-    log_set_archive_timestamp (access->logid, archive);
-    log_set_level (access->logid, 4);
-    // DEBUG4 ("log %s, size %ld, duration %u, archive %d", access->name, max_size, access->duration, archive);
-    return 0;
-}
-
-
-int restart_logging (ice_config_t *config)
-{
-    ice_config_t *current = config_get_config_unlocked();
-    int ret = 0;
-
-    config->error_log.logid = current->error_log.logid;
-    config->access_log.logid = current->access_log.logid;
-    config->playlist_log.logid = current->playlist_log.logid;
-    config->preroll_log.logid = current->preroll_log.logid;
-
-    if (recheck_log_file (config, &config->error_log.logid, config->error_log.name) < 0)
-        ret = -1;
-    else
-    {
-        log_set_trigger (config->error_log.logid, config->error_log.size);
-        log_set_reopen_after (config->error_log.logid, config->error_log.duration);
-        if (config->error_log.display > 0)
-            log_set_lines_kept (config->error_log.logid, config->error_log.display);
-        log_set_archive_timestamp (config->error_log.logid, config->error_log.archive);
-        log_set_level (config->error_log.logid, config->error_log.level);
-    }
-    thread_use_log_id (config->error_log.logid);
-    errorlog = config->error_log.logid; /* value stays static so avoid taking the config lock */
-
-    if (recheck_log_file (config, &config->preroll_log.logid, config->preroll_log.name) < 0)
-        ret = -1;
-    else
-    {
-        log_set_trigger (config->preroll_log.logid, config->preroll_log.size);
-        log_set_reopen_after (config->preroll_log.logid, config->preroll_log.duration);
-        if (config->preroll_log.display > 0)
-            log_set_lines_kept (config->preroll_log.logid, config->preroll_log.display);
-        log_set_archive_timestamp (config->preroll_log.logid, config->preroll_log.archive);
-        log_set_level (config->preroll_log.logid, 4);
-    }
-
-    if (recheck_access_log (config, &config->access_log) < 0)
-       ret = -1;
-
-    if (recheck_log_file (config, &config->playlist_log.logid, config->playlist_log.name) < 0)
-        ret = -1;
-    else
-    {
-        log_set_trigger (config->playlist_log.logid, config->playlist_log.size);
-        log_set_reopen_after (config->playlist_log.logid, config->playlist_log.duration);
-        if (config->playlist_log.display > 0)
-            log_set_lines_kept (config->playlist_log.logid, config->playlist_log.display);
-        log_set_archive_timestamp (config->playlist_log.logid, config->playlist_log.archive);
-        log_set_level (config->playlist_log.logid, 4);
-    }
-    playlistlog = config->playlist_log.logid;
-
-    // any logs for template based mounts
-    if (config->mounts)
-    {
-        mount_proxy *m = config->mounts;
-        while (m)
-        {
-            if (recheck_access_log (config, &m->access_log) < 0)
-                ret = -1;
-            m = m->next;
-        }
-    }
-    // any logs for specifically named mounts
-    if (config->mounts_tree)
-    {
-        avl_node *node = avl_get_first (config->mounts_tree);
-        while (node)
-        {
-            mount_proxy *m = (mount_proxy *)node->key;
-            node = avl_get_next (node);
-
-            if (recheck_access_log (config, &m->access_log) < 0)
-                ret = -1;
-        }
-    }
-    return ret;
-}
-
-
-int init_logging (ice_config_t *config)
-{
-    worker_logger_init();
-
-    if (strcmp (config->error_log.name, "-") == 0)
-        config->error_log.logid = log_open_file (stderr);
-    if (strcmp(config->access_log.name, "-") == 0)
-        config->access_log.logid = log_open_file (stderr);
-    return restart_logging (config);
-}
-
-
-int start_logging (ice_config_t *config)
-{
-    worker_logger (0);
-    return 0;
-}
-
-
-void stop_logging(void)
-{
-    worker_logger (1);
-}
-

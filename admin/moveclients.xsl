@@ -1,46 +1,61 @@
-<xsl:stylesheet xmlns:xsl = "http://www.w3.org/1999/XSL/Transform" version = "1.0" >
-<xsl:output method="xml" media-type="text/html" indent="yes" encoding="UTF-8"
-    doctype-system="http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"
-    doctype-public="-//W3C//DTD XHTML 1.0 Transitional//EN" />
+<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="1.0">
+    <!-- Import include files -->
+    <xsl:include href="includes/page.xsl"/>
+    <xsl:include href="includes/mountnav.xsl"/>
 
-<xsl:template match = "/icestats" >
-<html>
-<head>
-<title>Icecast Streaming Media Server</title>
-<link rel="stylesheet" type="text/css" href="/style.css" />
-</head>
-<body bgcolor="#000" topmargin="0" leftmargin="0" rightmargin="0" bottommargin="0">
+    <xsl:variable name="title">Move listeners</xsl:variable>
 
-<div class="main">
-
-<xsl:variable name = "currentmount" ><xsl:value-of select="current_source" /></xsl:variable>
-<div class="roundcont">
-<div class="roundtop">
-<img src="/images/corner_topleft.jpg" class="corner" style="display: none" />
-</div>
-<div class="newscontent">
-<h3>Move to which mountpoint ?</h3>
-<xsl:for-each select="source">
-	<table border="0" cellpadding="6" cellspacing="5" >
-	<tr>        
-		<td>Move from <xsl:copy-of select="$currentmount" /> to <xsl:value-of select="@mount" /></td>
-		<td>(<xsl:value-of select="listeners" /> Listeners)</td>
-		<td><a class="nav2" href="moveclients.xsl?mount={$currentmount}&amp;destination={@mount}">Move Clients</a></td>
-	</tr>        
-	</table>
-<br />
-<br />
-</xsl:for-each>
-<xsl:text disable-output-escaping="yes">&amp;</xsl:text>nbsp;
-</div>
-<div class="roundbottom">
-<img src="/images/corner_bottomleft.jpg" class="corner" style="display: none" />
-</div>
-</div>
-<div class="poster">Support icecast development at <a class="nav" href="http://www.icecast.org">www.icecast.org</a></div>
-</div>
-</body>
-</html>
-
-</xsl:template>
+    <xsl:template name="content">
+        <div class="section">
+            <h2><xsl:value-of select="$title" /></h2>
+            <section class="box">
+                <h3 class="box_title">Mountpoint <code><xsl:value-of select="@mount" /></code></h3>
+                <!-- Mount nav -->
+                <xsl:call-template name="mountnav">
+                    <xsl:with-param name="mount" select="current_source"/>
+                </xsl:call-template>
+                <xsl:choose>
+                    <xsl:when test="source">
+                        <xsl:choose>
+                            <xsl:when test="param-id">
+                                <p>Choose the mountpoint to which you want to move the listener to:</p>
+                            </xsl:when>
+                            <xsl:otherwise>
+                                <p>Choose the mountpoint to which you want to move the listeners to:</p>
+                            </xsl:otherwise>
+                        </xsl:choose>
+                        <form method="post" action="/admin/moveclients.xsl">
+                            Move from
+                            <code><xsl:value-of select="current_source" /></code>
+                            to
+                            <select name="destination" id="moveto">
+                                <xsl:for-each select="source">
+                                    <option value="{@mount}">
+                                        <xsl:value-of select="@mount" />
+                                    </option>
+                                </xsl:for-each>
+                            </select>
+                            with direction
+                            <select name="direction">
+                                <option value="up">up</option>
+                                <option value="down">down</option>
+                                <option value="replace-current">replace</option>
+                                <option value="replace-all" selected="selected">forget and replace</option>
+                            </select>
+                            <input type="hidden" name="id" value="{param-id}" />
+                            <input type="hidden" name="mount" value="{current_source}" />
+                            &#160;
+                            <input type="submit" value="Move listeners" />
+                        </form>
+                    </xsl:when>
+                    <xsl:otherwise>
+                        <aside class="warning">
+                            <strong>No mounts!</strong>
+                            There are no other mountpoints you could move the listeners to.
+                        </aside>
+                    </xsl:otherwise>
+                </xsl:choose>
+            </section>
+        </div>
+    </xsl:template>
 </xsl:stylesheet>

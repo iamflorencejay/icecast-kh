@@ -3,159 +3,134 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>, 
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
+ * Copyright 2011,      Dave 'justdave' Miller <justdave@mozilla.com>.
+ * Copyright 2011-2022, Philipp "ph3-der-loewe" Schafft <lion@lion.leolix.org>,
  */
 
 #ifndef __CFGFILE_H__
 #define __CFGFILE_H__
 
-#define CONFIG_EINSANE -1
-#define CONFIG_ENOROOT -2
+#define CONFIG_EINSANE  -1
+#define CONFIG_ENOROOT  -2
 #define CONFIG_EBADROOT -3
-#define CONFIG_EPARSE -4
+#define CONFIG_EPARSE   -4
 
-#define MAX_YP_DIRECTORIES 25
+#include <stdbool.h>
 
-#define XMLSTR		(xmlChar *)
-
-struct _mount_proxy;
-struct ice_config_tag;
-typedef struct _listener_t listener_t;
-
-#include "avl/avl.h"
-#include "auth.h"
+#include <libxml/tree.h>
+#include "common/thread/thread.h"
+#include "common/avl/avl.h"
+#include "icecasttypes.h"
 #include "compat.h"
 
+#define XMLSTR(str) ((xmlChar *)(str)) 
 
-typedef struct _redirect_host
-{
-    struct _redirect_host *next;
-    time_t next_update;
-    char *server;
-    int port;
-} redirect_host;
+#define CONFIG_PROBLEM_HOSTNAME         0x0001U
+#define CONFIG_PROBLEM_LOCATION         0x0002U
+#define CONFIG_PROBLEM_ADMIN            0x0004U
+#define CONFIG_PROBLEM_PRNG             0x0008U
+#define CONFIG_PROBLEM_UNKNOWN_NODE     0x0010U
+#define CONFIG_PROBLEM_OBSOLETE_NODE    0x0020U
+#define CONFIG_PROBLEM_INVALID_NODE     0x0040U
+#define CONFIG_PROBLEM_VALIDATION       0x0080U
 
+typedef enum _http_header_type {
+    /* static: headers are passed as is to the client. */
+    HTTP_HEADER_TYPE_STATIC,
+    /* CORS: headers are only sent to the client if it's a CORS request. */
+    HTTP_HEADER_TYPE_CORS
+} http_header_type;
 
-typedef struct access_log
-{
-    char *name;
-    int logid;
-    int log_ip;
-    int qstr;
-    int type;
-    int archive;
-    int display;
-    long size;
-    unsigned duration;
-    char *exclude_ext;
-} access_log;
+typedef struct ice_config_http_header_tag {
+    /* type of this header. See http_header_type */
+    http_header_type type;
 
-#define LOG_ACCESS_CLF                  0
-#define LOG_ACCESS_CLF_ESC              1
-
-typedef struct error_log
-{
-    char *name;
-    int logid;
-    int archive;
-    int display;
-    long size;
-    unsigned duration;
-    int level;
-} error_log;
-
-typedef struct playlist_log
-{
-    char *name;
-    int logid;
-    int archive;
-    int display;
-    long size;
-    unsigned duration;
-} playlist_log;
-
-typedef struct error_log preroll_log;
-
-
-typedef struct ice_config_dir_tag
-{
-    char *host;
-    int touch_interval;
-    struct ice_config_dir_tag *next;
-} ice_config_dir_t;
-
-typedef struct _config_options {
+    /* name and value of the header */
     char *name;
     char *value;
-    struct _config_options *next;
-} config_options_t;
+
+    /* filters */
+    int status;
+
+    /* link to the next list element */
+    struct ice_config_http_header_tag *next;
+} ice_config_http_header_t;
+
+struct _config_options {
+    char *type;
+    char *name;
+    char *value;
+    config_options_t *next;
+};
+
+typedef enum _mount_type {
+ MOUNT_TYPE_NORMAL,
+ MOUNT_TYPE_DEFAULT
+} mount_type;
+
+typedef enum {
+    FALLBACK_OVERRIDE_NONE = 0,
+    FALLBACK_OVERRIDE_ALL,
+    FALLBACK_OVERRIDE_OWN
+} fallback_override_t;
 
 typedef struct _mount_proxy {
-    char *mountname; /* The mountpoint this proxy is used for */
+    /* The mountpoint this proxy is used for */
+    char *mountname;
+    /* The type of the mount point */
+    mount_type mounttype;
+    /* Filename to dump this stream to (will be appended).
+     * NULL to not dump.
+     */
+    char *dumpfile;
+    /* Send contents of file to client before the stream */
+    char *intro_filename;
+    /* Switch new listener to fallback source when max listeners reached */
+    int fallback_when_full;
+    /* Max listeners for this mountpoint only.
+     * -1 to not limit here (i.e. only use the global limit)
+     */
+    int max_listeners;
+    /* Fallback mountname */
+    char *fallback_mount;
+    /* When this source arrives, do we steal back
+     * clients from the fallback?
+     */
+    fallback_override_t fallback_override;
+    /* Do we permit direct requests of this mountpoint?
+     * (or only indirect, through fallbacks)
+     */
+    bool allow_direct_access;
+    /* amount to send to a new client if possible, -1 take
+     * from global setting
+     */
+    int burst_size;
+    unsigned int queue_size_limit;
+    /* Do we list this on the xsl pages */
+    int hidden;
+    /* source timeout in seconds */
+    unsigned int source_timeout;
+    /* character set if not utf8 */
+    char *charset;
+    /* outgoing per-stream metadata interval */
+    int mp3_meta_interval;
+    /* additional HTTP headers */
+    ice_config_http_header_t *http_headers;
 
-    char *username; /* Username and password for this mountpoint. If unset, */
-    char *password; /* falls back to global source password */
+    /* maximum history size of played songs */
+    ssize_t max_history;
 
-    char *dumpfile; /* Filename to dump this stream to (will be appended). NULL
-                       to not dump. */
-    char *intro_filename;   /* Send contents of file to client before the stream */
+    struct event_registration_tag *event;
 
-    /* whether to allow matching files to work with http ranges */
-    int file_seekable;
-
-    int fallback_when_full; /* switch new listener to fallback source
-                               when max listeners reached */
-    /* Max bandwidth (kbps)  for this mountpoint only. -1 (default) is not specified */
-    int64_t max_bandwidth;
-
-    int max_listeners; /* Max listeners for this mountpoint only. -1 to not 
-                          limit here (i.e. only use the global limit) */
-    char *fallback_mount; /* Fallback mountname */
-
-    int fallback_override; /* When this source arrives, do we steal back
-                              clients from the fallback? */
-    int ban_client;     /* do we add a client on this to the ban list automatically */
-    int no_mount; /* Do we permit direct requests of this mountpoint? (or only
-                     indirect, through fallbacks) */
-    int so_sndbuf;      /* TCP send buffer size for new clients */
-    uint32_t burst_size;
-    uint32_t min_queue_size;     /* minimum length of queue */
-    uint32_t queue_size_limit;
-    int hidden; /* Do we list this on the xsl pages */
-    unsigned int source_timeout;  /* source timeout in seconds */
-    char *charset;  /* character set if not utf8 */
-    int allow_chunked; /* allow chunked transfers */
-    int mp3_meta_interval; /* outgoing per-stream metadata interval */
-    int max_send_size;
-    int filter_theora; /* prevent theora pages getting queued */
-    int url_ogg_meta; /* enable to allow updates via url requests for ogg */
-    int ogg_passthrough; /* enable to prevent the ogg stream being rebuilt */
-    int admin_comments_only; /* enable to only show comments set from the admin page */
-    int skip_accesslog;         /* skip logging client to access log */
-    int intro_skip_replay;      /* duration to cache IPs, for intro playing */
-
-    int64_t limit_rate;
-
-    /* duration (secs) for mountpoint to be kept reserved after source client exits */
-    int wait_time;
-
-    char *auth_type; /* Authentication type */
-    struct auth_tag *auth;
     char *cluster_password;
-    config_options_t *auth_options; /* Options for this type */
-    char *on_connect;
-    char *on_disconnect;
-    unsigned int max_stream_duration;
+    auth_stack_t *authstack;
     unsigned int max_listener_duration;
 
-    struct access_log      access_log;
-    preroll_log     preroll_log;
-
-    char *redirect;
     char *stream_name;
     char *stream_description;
     char *stream_url;
@@ -168,115 +143,118 @@ typedef struct _mount_proxy {
     struct _mount_proxy *next;
 } mount_proxy;
 
-typedef struct _aliases {
+#define ALIAS_FLAG_PREFIXMATCH          0x0001
+
+typedef struct _resource {
     char *source;
     char *destination;
     int port;
     char *bind_address;
-    struct _aliases *next;
-}aliases;
+    char *listen_socket;
+    char *vhost;
+    char *module;
+    char *handler;
+    operation_mode omode;
+    unsigned int flags;
+    struct _resource *next;
+} resource_t;
 
-
-struct xforward_entry
-{
-    char *ip;
-    struct xforward_entry *next;
-};
-
-
-struct _listener_t 
-{
-    struct _listener_t *next;
-    int refcount;
-    int port;
-    char *bind_address;
-    char *shoutcast_mount;
-    int qlen;
-    int shoutcast_compat;
-    int ssl;
-    int so_sndbuf;
-    int so_mss;
-};
-
-
-#define RELAY_RUNNING                   1
-#define RELAY_CLEANUP                   (1<<1)
-#define RELAY_ON_DEMAND                 (1<<2)
-#define RELAY_ICY_META                  (1<<3)
-#define RELAY_FROM_MASTER               (1<<4)
-#define RELAY_SLAVE                     (1<<5)
-#define RELAY_IN_LIST                   (1<<6)
-
-typedef struct _relay_server_host
-{
-    struct _relay_server_host *next;
-    char *ip;
-    char *bind;
-    char *mount;
-    int port;
+typedef struct _yp_directory {
+    char *url;
     int timeout;
-    int skip;
-} relay_server_host;
+    int touch_interval;
+    char *listen_socket_id;
+    struct _yp_directory *next;
+} yp_directory_t;
 
+typedef enum _listener_type_tag {
+    LISTENER_TYPE_ERROR,
+    LISTENER_TYPE_NORMAL,
+    LISTENER_TYPE_VIRTUAL
+} listener_type_t;
 
-typedef struct _relay_server
-{
-    struct _relay_server *new_details;
-    struct source_tag *source;
-    time_t updated;
-    int interval;
-    int run_on;
-    unsigned char type;
-    unsigned char flags;
+typedef struct _listener_t {
+    struct _listener_t *next;
+    char *id;
+    char *on_behalf_of;
+    listener_type_t type;
+    int port;
+    int so_sndbuf;
+    int listen_backlog;
+    char *bind_address;
+    int shoutcast_compat;
+    char *shoutcast_mount;
+    tlsmode_t tls;
+    auth_stack_t *authstack;
+    /* additional HTTP headers */
+    ice_config_http_header_t *http_headers;
+} listener_t;
+
+typedef struct _config_tls_context {
+    char *cert_file;
+    char *key_file;
+    char *cipher_list;
+} config_tls_context_t;
+
+typedef struct {
+    char *server;
+    int port;
+    char *mount;
+    char *username;
+    char *password;
+    char *bind;
+    int mp3metadata;
+} relay_config_upstream_t;
+
+typedef struct {
     char *localmount;
-    relay_server_host *hosts, *in_use;
-    char *username;
-    char *password;
-} relay_server;
+    int on_demand;
+    size_t upstreams;
+    relay_config_upstream_t *upstream;
+    relay_config_upstream_t upstream_default;
+} relay_config_t;
 
+typedef enum {
+    PRNG_SEED_TYPE_READ_ONCE,
+    PRNG_SEED_TYPE_READ_WRITE,
+    PRNG_SEED_TYPE_DEVICE,
+    PRNG_SEED_TYPE_STATIC,
+    PRNG_SEED_TYPE_PROFILE
+} prng_seed_type_t;
 
-typedef struct
-{
-    char *hostname;
-    int  port;
-    char *username;
-    char *password;
-} ice_master_details;
+typedef struct prng_seed_config_tag prng_seed_config_t;
+struct prng_seed_config_tag {
+    char *filename;
+    prng_seed_type_t type;
+    ssize_t size;
+    prng_seed_config_t *next;
+};
 
-
-typedef struct ice_config_tag
-{
+struct ice_config_tag {
     char *config_filename;
 
-    char *gitversion;
+    unsigned int config_problems;
+
     char *location;
     char *admin;
 
     int client_limit;
     int source_limit;
+    int body_size_limit;
     unsigned int queue_size_limit;
-    int min_queue_size;
-    int workers_count;
-    uint32_t burst_size;
+    unsigned int burst_size;
     int client_timeout;
     int header_timeout;
     int source_timeout;
-    int ice_login;
-    int64_t max_bandwidth;
-    int max_listeners;
+    int body_timeout;
     int fileserve;
     int on_demand; /* global setting for all relays */
 
     char *shoutcast_mount;
-    char *source_password;
-    char *admin_username;
-    char *admin_password;
-    char *relay_username;
-    char *relay_password;
+    char *shoutcast_user;
+    auth_stack_t *authstack;
 
-    int inactivity_timeout;
-    int touch_interval;
-    ice_config_dir_t *dir_list;
+    struct event_registration_tag *event;
 
     char *hostname;
     int port;
@@ -288,73 +266,77 @@ typedef struct ice_config_tag
     char *master_server;
     int master_server_port;
     int master_update_interval;
-    char *master_bind;
     char *master_username;
     char *master_password;
-    int master_relay_auth;
-    int master_relay_retry;
-    int master_ssl_port;
-    int master_redirect;
-    int master_run_on;
-    int max_redirects;
-    struct _redirect_host *redirect_hosts;
-    struct xforward_entry *xforward;
 
-    relay_server *relays;
+    ice_config_http_header_t *http_headers;
+
+    size_t relay_length;
+    relay_config_t **relay;
 
     mount_proxy *mounts;
-    avl_tree *mounts_tree;
 
     char *server_id;
     char *base_dir;
     char *log_dir;
     char *pidfile;
+    char *null_device;
     char *banfile;
     char *allowfile;
-    char *agentfile;
-    char *cert_file;
-    char *key_file;
-    char *ca_file;
-    char *cipher_list;
     char *webroot_dir;
     char *adminroot_dir;
-    struct _aliases *aliases;
-    unsigned slaves_count;
+    prng_seed_config_t *prng_seed;
+    resource_t *resources;
+    reportxml_database_t *reportxml_db;
 
-    struct access_log      access_log;
-    struct error_log       error_log;
-    struct playlist_log    playlist_log;
-    preroll_log     preroll_log;
+    char *access_log;
+    char *error_log;
+    char *playlist_log;
+    int loglevel;
+    int logsize;
+    int logarchive;
+    size_t access_log_lines_kept;
+    size_t error_log_lines_kept;
+    size_t playlist_log_lines_kept;
+
+    config_tls_context_t tls_context;
 
     int chroot;
     int chuid;
     char *user;
     char *group;
-    char *yp_url[MAX_YP_DIRECTORIES];
-    int    yp_url_timeout[MAX_YP_DIRECTORIES];
-    int    yp_touch_interval[MAX_YP_DIRECTORIES];
-    int num_yp_directories;
-} ice_config_t;
+
+    yp_directory_t *yp_directories;
+};
 
 typedef struct {
     rwlock_t config_lock;
+    mutex_t relay_lock;
 } ice_config_locks;
 
 void config_initialize(void);
 void config_shutdown(void);
 
+operation_mode config_str_to_omode(ice_config_t *configuration, xmlNodePtr node, const char *str);
+
+void config_reread_config(void);
 int config_parse_file(const char *filename, ice_config_t *configuration);
 int config_initial_parse_file(const char *filename);
 int config_parse_cmdline(int arg, char **argv);
-void config_set_config (ice_config_t *new_config, ice_config_t *old_config);
+void config_set_config(ice_config_t *config);
 listener_t *config_clear_listener (listener_t *listener);
-relay_server *config_clear_relay (relay_server *relay);
 void config_clear(ice_config_t *config);
-mount_proxy *config_find_mount (ice_config_t *config, const char *mount);
-void config_xml_parse_failure (void*x,  xmlErrorPtr error);
-int config_qsizing_conv_a2n (const char *str, uint32_t *p);
+mount_proxy *config_find_mount(ice_config_t *config, const char *mount, mount_type type);
 
-int config_rehash(void);
+listener_t *config_copy_listener_one(const listener_t *listener);
+
+config_options_t *config_parse_options(xmlNodePtr node);
+void config_clear_options(config_options_t *options);
+
+void config_parse_http_headers(xmlNodePtr                  node,
+                               ice_config_http_header_t  **http_headers,
+                               ice_config_t               *configuration);
+void config_clear_http_header(ice_config_http_header_t *header);
 
 ice_config_locks *config_locks(void);
 
@@ -366,6 +348,3 @@ void config_release_config(void);
 ice_config_t *config_get_config_unlocked(void);
 
 #endif  /* __CFGFILE_H__ */
-
-
-

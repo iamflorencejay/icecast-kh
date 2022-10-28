@@ -8,6 +8,7 @@
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
+ * Copyright 2014,      Philipp "ph3-der-loewe" Schafft <lion@lion.leolix.org>,
  */
 
 
@@ -16,6 +17,6 @@
 
 #include "format_ogg.h"
 
-ogg_codec_t *initial_midi_page (format_plugin_t *plugin, ogg_page *page);
+ogg_codec_t *initial_midi_page(format_plugin_t *plugin, ogg_page *page);
 
 #endif /* __FORMAT_MIDI_H */

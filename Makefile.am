@@ -2,34 +2,14 @@
 
 ACLOCAL_AMFLAGS = -I m4
 
-SUBDIRS = conf doc web admin src
-if WIN32
-SUBDIRS += win32
-endif
+SUBDIRS = src conf doc web admin win32 examples tests
 
-BUILT_SOURCES = git_hash.h
-dist_check_SCRIPTS = GIT-VERSION-GEN
-CLEANFILES = git_hash.h
-
-EXTRA_DIST = HACKING config.h.vc6 m4/acx_pthread.m4 m4/ogg.m4 \
-    m4/theora.m4 m4/vorbis.m4 m4/speex.m4\
-    m4/xiph_compiler.m4 m4/xiph_curl.m4 m4/xiph_net.m4 \
-    m4/xiph_types.m4 m4/xiph_xml2.m4 m4/xiph_openssl.m4 icecast.spec
+EXTRA_DIST = README.md HACKING tap-driver.sh
 
 docdir = $(datadir)/doc/$(PACKAGE)
-doc_DATA = README AUTHORS COPYING NEWS TODO
+doc_DATA = README.md AUTHORS COPYING NEWS ChangeLog
 
-git_hash.h: FORCE
-	@$(SHELL_PATH) $(srcdir)/GIT-VERSION-GEN
-FORCE:
+dist_pkgdata_DATA = report-db.xml
 
-debug:
-	$(MAKE) all CFLAGS="-Wno-unused-parameter @DEBUG@"
-
-profile:
-	$(MAKE) all CFLAGS="@PROFILE@"
-
-staticdebug:
-	$(MAKE) all CFLAGS="-g -DLIBXML_STATIC -DCURL_STATICLIB" LDFLAGS="${LDFLAGS} -all-static"
 static:
-	$(MAKE) all CFLAGS="-O2 -DLIBXML_STATIC -DCURL_STATICLIB" LDFLAGS="${LDFLAGS} -static-libstdc++" CXXFLAGS=
+	$(MAKE) all LDFLAGS="${LDFLAGS} -all-static"

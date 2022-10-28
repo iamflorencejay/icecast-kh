@@ -3,55 +3,66 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
+ * Copyright 2012-2018, Philipp "ph3-der-loewe" Schafft <lion@lion.leolix.org>,
  */
 
 /* -*- c-basic-offset: 4; -*- */
 /* format.c
-**
-** format plugin implementation
-**
-*/
+ **
+ ** format plugin implementation
+ **
+ */
 
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
 
-#include <sys/types.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef HAVE_STRINGS_H
 # include <strings.h>
 #endif
+#ifdef HAVE_SYS_TYPES_H
+# include <sys/types.h>
+#endif
 
-#include "compat.h"
+#include <vorbis/codec.h>
+
 #include "connection.h"
 #include "refbuf.h"
 
 #include "source.h"
 #include "format.h"
 #include "global.h"
-#include "httpp/httpp.h"
 
 #include "format_ogg.h"
 #include "format_mp3.h"
 #include "format_ebml.h"
+#include "format_text.h"
 
 #include "logging.h"
 #include "stats.h"
 #define CATMODULE "format"
 
+static int format_prepare_headers (source_t *source, client_t *client);
 
-format_type_t format_get_type(const char *content_type)
+
+format_type_t format_get_type (const char *contenttype)
 {
-    char contenttype [256];
+    char buf[32];
+    const char *separator = strpbrk(contenttype, "; \t");
 
-    if (content_type == NULL) return FORMAT_TYPE_UNDEFINED;
-    sscanf (content_type, "%250[^ ;]", contenttype);
+    if (separator && (size_t)(separator - contenttype) < sizeof(buf)) {
+        memcpy(buf, contenttype, separator - contenttype);
+        buf[separator - contenttype] = 0;
+        contenttype = buf;
+    }
+
     if(strcmp(contenttype, "application/x-ogg") == 0)
         return FORMAT_TYPE_OGG; /* Backwards compatibility */
     else if(strcmp(contenttype, "application/ogg") == 0)
@@ -70,497 +81,423 @@ format_type_t format_get_type(const char *content_type)
         return FORMAT_TYPE_EBML;
     else if(strcmp(contenttype, "video/x-matroska-3d") == 0)
         return FORMAT_TYPE_EBML;
-    else if(strcmp(contenttype, "audio/aac") == 0)
-        return FORMAT_TYPE_AAC;
-    else if(strcmp(contenttype, "audio/aacp") == 0)
-        return FORMAT_TYPE_AAC;
-    else if(strcmp(contenttype, "audio/mpeg") == 0)
-        return FORMAT_TYPE_MPEG;
-    else if(strcmp(contenttype, "video/MP2T") == 0)
-        return FORMAT_TYPE_MPEG;
+    else if(strcmp(contenttype, "text/plain") == 0)
+        return FORMAT_TYPE_TEXT;
     else
-        return FORMAT_TYPE_UNDEFINED;
+        /* We default to the Generic format handler, which
+           can handle many more formats than just mp3.
+           Let's warn that this is not well supported */
+        ICECAST_LOG_WARN("Unsupported or legacy stream type: \"%s\". Falling back to generic minimal handler for best effort.", contenttype);
+        return FORMAT_TYPE_GENERIC;
 }
 
-
-void format_apply_client (format_plugin_t *format, client_t *client)
-{
-    if (format->type == FORMAT_TYPE_UNDEFINED)
-        return;
-
-    if (client && format->parser != client->parser) // a relay client may have a new parser
-    {
-        if (format->parser) httpp_destroy (format->parser);
-        format->parser = client->parser;
-    }
-    if (format->apply_client)
-        format->apply_client (format, client);
-    format->read_bytes = 0;
-    format->sent_bytes = 0;
-}
-
-
-void format_plugin_clear (format_plugin_t *format, client_t *client)
-{
-    if (format == NULL)
-        return;
-    if (format->free_plugin)
-        format->free_plugin (format, client);
-    free (format->charset);
-    free (format->contenttype);
-    if (format->parser)
-        if (client == NULL || format->parser != client->parser) // a relay client may have a new parser
-            httpp_destroy (format->parser);
-    memset (format, 0, sizeof (format_plugin_t));
-}
-
-
-int format_get_plugin (format_plugin_t *plugin)
+int format_get_plugin(format_type_t type, source_t *source)
 {
     int ret = -1;
 
-    if (plugin->_state)
-    {
-        INFO1 ("internal format details already created for %s", plugin->mount);
-        return 0;
-    }
-    plugin->qblock_copy = refbuf_copy_default;
-    switch (plugin->type)
-    {
+    switch (type) {
         case FORMAT_TYPE_OGG:
-            ret = format_ogg_get_plugin (plugin);
-            break;
-        case FORMAT_TYPE_AAC:
-        case FORMAT_TYPE_MPEG:
-            ret = format_mp3_get_plugin (plugin);
-            break;
+            ret = format_ogg_get_plugin(source);
+        break;
         case FORMAT_TYPE_EBML:
-            ret = format_ebml_get_plugin (plugin);
-            break;
+            ret = format_ebml_get_plugin(source);
+        break;
+        case FORMAT_TYPE_TEXT:
+            ret = format_text_get_plugin(source);
+        break;
+        case FORMAT_TYPE_GENERIC:
+            ret = format_mp3_get_plugin(source);
+        break;
         default:
-            INFO1 ("unparsed format detected for %s", plugin->mount);
-            break;
+        break;
     }
 
     return ret;
 }
 
 
-int format_check_frames (struct format_check_t *c)
+/* clients need to be start from somewhere in the queue so we will look for
+ * a refbuf which has been previously marked as a sync point.
+ */
+static void find_client_start(source_t *source, client_t *client)
 {
-    int ret = -1;
-    refbuf_t *r = refbuf_new (16384);
-    mpeg_sync sync;
-    mpeg_setup (&sync, c->desc);
-    mpeg_check_numframes (&sync, 20);
+    refbuf_t *refbuf = source->burst_point;
 
-    do
+    /* we only want to attempt a burst at connection time, not midstream
+     * however streams like theora may not have the most recent page marked as
+     * a starting point, so look for one from the burst point */
+    if (client->intro_offset == -1 && source->stream_data_tail
+            && source->stream_data_tail->sync_point)
+        refbuf = source->stream_data_tail;
+    else
     {
-        int bytes = pread (c->fd, r->data, 16384, 0);
-        if (bytes <= 0)
-            break;
-
-        r->len = bytes;
-        int unprocessed = mpeg_complete_frames (&sync, r, 0);
-        if (r->len == 0)
+        size_t size = client->intro_offset;
+        refbuf = source->burst_point;
+        while (size > 0 && refbuf && refbuf->next)
         {
+            size -= refbuf->len;
+            refbuf = refbuf->next;
+        }
+    }
+
+    while (refbuf)
+    {
+        if (refbuf->sync_point)
+        {
+            client_set_queue (client, refbuf);
+            client->check_buffer = format_advance_queue;
+            client->write_to_client = source->format->write_buf_to_client;
+            client->intro_offset = -1;
             break;
         }
-        c->offset = bytes - (r->len + unprocessed);
-        c->type = mpeg_get_type (&sync);
-        c->srate = mpeg_get_samplerate (&sync);
-        c->channels = mpeg_get_channels (&sync);
-        c->bitrate = mpeg_get_bitrate (&sync);
-        ret = 0;
-    } while (0);
-    refbuf_release (r);
-    mpeg_cleanup (&sync);
-
-    return ret;
+        refbuf = refbuf->next;
+    }
 }
 
 
-int format_file_read (client_t *client, format_plugin_t *plugin, icefile_handle f)
+static int get_file_data(FILE *intro, client_t *client)
 {
     refbuf_t *refbuf = client->refbuf;
-    ssize_t bytes = -1, len, range = 0;
-    int unprocessed = 0;
+    size_t bytes;
 
-    do
-    {
-        len = 8192;
-        if (refbuf == NULL)
-        {
-            if (file_in_use (f) == 0)
-                return -2;
-            refbuf = client->refbuf = refbuf_new (len);
-            client->pos = refbuf->len;
-            client->queue_pos = 0;
-            refbuf->flags |= BUFFER_LOCAL_USE;
-        }
-        if (client->pos < refbuf->len)
-            break;
+    if (intro == NULL || fseek (intro, client->intro_offset, SEEK_SET) < 0)
+        return 0;
+    bytes = fread (refbuf->data, 1, 4096, intro);
+    if (bytes == 0)
+        return 0;
 
-        if (refbuf->next)
-        {
-            //DEBUG1 ("next intro block is %d", refbuf->next->len);
-            client->refbuf = refbuf->next;
-            refbuf->next = NULL;
-            refbuf_release (refbuf);
-            client->pos = 0;
-            return 0;
-        }
-        if ((refbuf->flags & BUFFER_LOCAL_USE) == 0)
-        {
-            client_set_queue (client, NULL);
-            refbuf = NULL;
-            continue;
-        }
-
-        if (file_in_use (f) == 0) return -2;
-
-        if (client->flags & CLIENT_RANGE_END)
-        {
-            if (client->intro_offset >= client->connection.discon.offset)
-            {
-                DEBUG1 ("End of requested range (%" PRId64 ")", client->connection.discon.offset);
-                return -1;
-            }
-            if (client->connection.discon.offset < (uint64_t)-1)
-            {
-                range = client->connection.discon.offset - client->intro_offset + 1;
-                if (range && range < len)
-                    len = range;
-            }
-        }
-        else
-            if (client->connection.discon.time && client->worker->current_time.tv_sec >= client->connection.discon.time)
-                return -1;
-
-        bytes = pread (f, refbuf->data, len, client->intro_offset);
-        if (bytes <= 0)
-        {
-            client->flags &= ~CLIENT_HAS_INTRO_CONTENT;
-            return bytes < 0 ? -2 : -1;
-        }
-        refbuf->len = bytes;
-        client->pos = 0;
-        if (plugin && plugin->align_buffer)
-        {
-            /* here the buffer may require truncating to keep the buffers aligned on
-             * certain boundaries */
-            unprocessed = plugin->align_buffer (client, plugin);
-            if (unprocessed == bytes)
-            {
-                if (range == 0)
-                    return -1;
-                refbuf->len = unprocessed;
-                unprocessed = 0;
-            }
-            if (unprocessed < 0 || unprocessed > bytes)
-            {
-                unprocessed = 0;
-                client->connection.error = 1;
-            }
-        }
-        client->intro_offset += (bytes - unprocessed);
-        if (unprocessed == 0 && refbuf->len)
-            break;
-    } while (1);
-    return refbuf->len - client->pos;
+    refbuf->len = (unsigned int)bytes;
+    return 1;
 }
 
 
-int format_generic_write_to_client (client_t *client)
+/* call to check the buffer contents for file reading. move the client
+ * to right place in the queue at end of file else repeat file if queue
+ * is not ready yet.
+ */
+int format_check_file_buffer (source_t *source, client_t *client)
+{
+    refbuf_t *refbuf = client->refbuf;
+
+    if (refbuf == NULL)
+    {
+        /* client refers to no data, must be from a move */
+        if (source->client)
+        {
+            find_client_start (source, client);
+            return -1;
+        }
+        /* source -> file fallback, need a refbuf for data */
+        refbuf = refbuf_new (PER_CLIENT_REFBUF_SIZE);
+        client->refbuf = refbuf;
+        client->pos = refbuf->len;
+        client->intro_offset = 0;
+    }
+    if (client->pos == refbuf->len)
+    {
+        if (get_file_data (source->intro_file, client))
+        {
+            client->pos = 0;
+            client->intro_offset += refbuf->len;
+        }
+        else
+        {
+            if (source->stream_data_tail)
+            {
+                /* better find the right place in queue for this client */
+                client_set_queue (client, NULL);
+                find_client_start (source, client);
+            }
+            else
+                client->intro_offset = 0;  /* replay intro file */
+            return -1;
+        }
+    }
+    return 0;
+}
+
+
+/* call this to verify that the HTTP data has been sent and if so setup
+ * callbacks to the appropriate format functions
+ */
+int format_check_http_buffer(source_t *source, client_t *client)
+{
+    refbuf_t *refbuf = client->refbuf;
+
+    if (refbuf == NULL)
+        return -1;
+
+    if (client->respcode == 0)
+    {
+        ICECAST_LOG_DEBUG("processing pending client headers");
+
+        if (format_prepare_headers (source, client) < 0)
+        {
+            ICECAST_LOG_ERROR("internal problem, dropping client");
+            client->con->error = 1;
+            return -1;
+        }
+        client->respcode = 200;
+        stats_event_inc(NULL, "listeners");
+        stats_event_inc(NULL, "listener_connections");
+        stats_event_inc(source->mount, "listener_connections");
+    }
+
+    if (client->pos == refbuf->len)
+    {
+        client->write_to_client = source->format->write_buf_to_client;
+        client->check_buffer = format_check_file_buffer;
+        client->intro_offset = 0;
+        client->pos = refbuf->len = 4096;
+        return -1;
+    }
+    return 0;
+}
+
+
+int format_generic_write_to_client(client_t *client)
 {
     refbuf_t *refbuf = client->refbuf;
     int ret;
     const char *buf = refbuf->data + client->pos;
     unsigned int len = refbuf->len - client->pos;
 
-    ret = client_send_bytes (client, buf, len);
+    ret = client_send_bytes(client, buf, len);
 
     if (ret > 0)
-    {
         client->pos += ret;
-        client->counter += ret;
-        client->queue_pos += ret;
-    }
 
     return ret;
 }
 
 
-int format_general_headers (format_plugin_t *plugin, client_t *client)
+/* This is the commonly used for source streams, here we just progress to
+ * the next buffer in the queue if there is no more left to be written from
+ * the existing buffer.
+ */
+int format_advance_queue(source_t *source, client_t *client)
 {
-    unsigned remaining = 4096 - client->refbuf->len;
-    char *ptr = client->refbuf->data + client->refbuf->len;
-    int bytes = 0;
-    int bitrate_filtered = 0;
-    avl_node *node;
-    ice_config_t *config;
-    uint64_t length = 0; 
+    refbuf_t *refbuf = client->refbuf;
 
-    /* hack for flash player, it wants a length. */
-    if (httpp_getvar (client->parser, "x-flash-version"))
-        length = 221183499;
-    else
+    if (refbuf == NULL)
+        return -1;
+
+    if (refbuf->next == NULL && client->pos == refbuf->len)
+        return -1;
+
+    /* move to the next buffer if we have finished with the current one */
+    if (refbuf->next && client->pos == refbuf->len)
     {
-        // flash may not send above header, so check for swf in referer
-        const char *referer = httpp_getvar (client->parser, "referer");
-        if (referer)
-        {
-            int len = strcspn (referer, "?");
-            if (len >= 4 && strncmp (referer+len-4, ".swf", 4) == 0)
-                length = 221183499;
-        }
+        client_set_queue (client, refbuf->next);
+        refbuf = client->refbuf;
     }
-
-    if (client->respcode == 0)
-    {
-        const char *useragent = httpp_getvar (client->parser, "user-agent");
-        const char *ver = httpp_getvar (client->parser, HTTPP_VAR_VERSION);
-        const char *protocol;
-        const char *contenttypehdr = "Content-Type";
-        const char *contenttype = plugin ? plugin->contenttype : "application/octet-stream";
-        const char *fs = httpp_getvar (client->parser, "__FILESIZE");
-        const char *opt = httpp_get_query_param (client->parser, "_hdr");
-        int fmtcode = 0;
-#define FMT_RETURN_ICY          1
-#define FMT_LOWERCASE_TYPE      2
-#define FMT_FORCE_AAC           4
-#define FMT_DISABLE_CHUNKED     8
-
-        do
-        {
-            if (ver && strcmp (ver, "1.1") == 0)
-                protocol = "HTTP/1.1";
-            else
-                protocol = "HTTP/1.0";
-            if (opt)
-            {
-                fmtcode = atoi (opt);
-                break;
-            }
-            // ignore following settings for files.
-            if (fs == NULL && useragent && plugin)
-            {
-                if (strstr (useragent, "shoutcastsource")) /* hack for mpc */
-                    fmtcode = FMT_RETURN_ICY;
-                if (strstr (useragent, "Windows-Media-Player")) /* hack for wmp*/
-                    fmtcode = FMT_RETURN_ICY;
-                if (strstr (useragent, "RealMedia")) /* hack for rp (mainly mobile) */
-                    fmtcode = FMT_RETURN_ICY;
-                if (strstr (useragent, "Shoutcast Server")) /* hack for sc_serv */
-                    fmtcode = FMT_LOWERCASE_TYPE;
-                // if (strstr (useragent, "Sonos"))
-                //    contenttypehdr = "content-type";
-                if (plugin->type == FORMAT_TYPE_AAC && strstr (useragent, "AppleWebKit"))
-                    fmtcode |= FMT_FORCE_AAC;
-                if (strstr (useragent, "BlackBerry"))
-                {
-                    fmtcode |= FMT_RETURN_ICY;
-                    if (plugin->type == FORMAT_TYPE_AAC)
-                        fmtcode |= FMT_FORCE_AAC;
-                }
-            }
-        } while (0);
-
-        if (fmtcode & FMT_DISABLE_CHUNKED)
-            client->flags &= ~CLIENT_KEEPALIVE;
-        if (fmtcode & FMT_RETURN_ICY)
-            protocol = "ICY";
-        if (fmtcode & FMT_LOWERCASE_TYPE)
-            contenttypehdr = "content-type";
-        if (fmtcode & FMT_FORCE_AAC) // ie for avoiding audio/aacp
-            contenttype = "audio/aac";
-        if (fs)
-        {
-            uint64_t len = (uint64_t)-1;
-            sscanf (fs, "%" SCNuMAX, &len);
-            if (length == 0 || len < length)
-                length = len;
-        }
-        if (client->flags & CLIENT_RANGE_END)
-        {
-            if (length && client->connection.discon.offset > length)
-                client->connection.discon.offset = length - 1;
-
-            if (client->intro_offset > client->connection.discon.offset)
-            {
-                DEBUG2 ("client range invalid (%ld, %" PRIu64 ")", (long)client->intro_offset, client->connection.discon.offset);
-                return -1;
-            }
-            uint64_t len = client->connection.discon.offset - client->intro_offset + 1;
-            char total_size [32] = "*";
-
-            if (fs) // allow range on files
-            {
-                snprintf (total_size, sizeof total_size, "%" PRIu64, length);
-                client->respcode = 206;
-            }
-            else
-            {
-                // ignore ranges on streams, treat as full
-                client->connection.discon.offset = 0;
-                client->intro_offset = 0;
-                client->flags &= ~CLIENT_RANGE_END;
-                len = 0;
-            }
-            length = len;
-            if (length)
-            {
-                bytes = snprintf (ptr, remaining, "%s 206 Partial Content\r\n"
-                        "%s: %s\r\n"
-                        "Accept-Ranges: bytes\r\n"
-                        "Content-Length: %" PRIu64 "\r\n"
-                        "Content-Range: bytes %" PRIu64 "-%" PRIu64 "/%s\r\n",
-                        protocol, contenttypehdr,
-                        contenttype ? contenttype : "application/octet-stream",
-                        len, (uint64_t)client->intro_offset,
-                        client->connection.discon.offset, total_size);
-                client->respcode = 206;
-            }
-            if (client->parser->req_type != httpp_req_head && length < 100 && (client->flags & CLIENT_RANGE_END) && fs == NULL)
-            {
-                refbuf_t *r = refbuf_new (length);
-                memset (r->data, 255, length);
-                refbuf_release (client->refbuf->next); // truncate any, maybe intro content
-                client->refbuf->next = r;
-                r->flags |= WRITE_BLOCK_GENERIC;
-                plugin = NULL;
-                client->flags &= ~(CLIENT_AUTHENTICATED|CLIENT_HAS_INTRO_CONTENT); // drop these flags
-                DEBUG2 ("wrote %d bytes for partial request from %s", (int)length, &client->connection.ip[0]);
-            }
-        }
-        if (client->respcode == 0)
-        {
-            char datebuf [100] = "\0";
-            struct tm result;
-
-            if (gmtime_r (&client->worker->current_time.tv_sec, &result))
-            {
-                if (strftime (datebuf, sizeof(datebuf), "Date: %a, %d %b %Y %X GMT\r\n", &result) == 0)
-                {
-                    datebuf[0] = '\0';
-                    sock_set_error (0);
-                }
-            }
-
-            if (contenttype == NULL)
-                contenttype = "application/octet-stream";
-            if (length)
-            {
-                client->respcode = 200;
-                bytes = snprintf (ptr, remaining, "%s 200 OK\r\n"
-                        "Content-Length: %" PRIu64 "\r\n"
-                        "%s: %s\r\n%s", protocol, length, contenttypehdr, contenttype, datebuf);
-            }
-            else
-            {
-                int chunked = 0;
-                const char *TE = "";
-
-                if (plugin && plugin->flags & FORMAT_FL_ALLOW_HTTPCHUNKED)
-                {
-                    chunked = (ver == NULL || strcmp (ver, "1.0") == 0) ? 0 : 1;
-                }
-                if (chunked && (fmtcode & FMT_DISABLE_CHUNKED) == 0)
-                {
-                    client->flags |= CLIENT_CHUNKED;
-                    TE = "Transfer-Encoding: chunked\r\n";
-                }
-                client->flags &= ~CLIENT_KEEPALIVE;
-                client->respcode = 200;
-
-                bytes = snprintf (ptr, remaining, "%s 200 OK\r\n%s"
-                        "%s: %s\r\n%s", protocol, TE, contenttypehdr, contenttype, datebuf);
-            }
-        }
-        remaining -= bytes;
-        ptr += bytes;
-    }
-
-    if (plugin && plugin->parser)
-    {
-        /* iterate through source http headers and send to client */
-        avl_tree_rlock (plugin->parser->vars);
-        node = avl_get_first (plugin->parser->vars);
-        while (node)
-        {
-            int next = 1;
-            http_var_t *var = (http_var_t *)node->key;
-            bytes = 0;
-            if (!strcasecmp (var->name, "ice-audio-info"))
-            {
-                /* convert ice-audio-info to icy-br */
-                char *brfield = NULL;
-                unsigned int bitrate;
-
-                if (bitrate_filtered == 0)
-                    brfield = strstr (var->value, "bitrate=");
-                if (brfield && sscanf (brfield, "bitrate=%u", &bitrate))
-                {
-                    bytes = snprintf (ptr, remaining, "icy-br:%u\r\n", bitrate);
-                    next = 0;
-                    bitrate_filtered = 1;
-                }
-                else
-                    /* show ice-audio_info header as well because of relays */
-                    bytes = snprintf (ptr, remaining, "%s: %s\r\n", var->name, var->value);
-            }
-            else
-            {
-                if (strcasecmp (var->name, "ice-password") &&
-                        strcasecmp (var->name, "icy-metaint") &&
-                        strncasecmp (var->name, "Access-control-", 15))
-                {
-                    if (!strncasecmp ("ice-", var->name, 4))
-                    {
-                        if (!strcasecmp ("ice-public", var->name))
-                            bytes = snprintf (ptr, remaining, "icy-pub:%s\r\n", var->value);
-                        else
-                            if (!strcasecmp ("ice-bitrate", var->name))
-                                bytes = snprintf (ptr, remaining, "icy-br:%s\r\n", var->value);
-                            else
-                                bytes = snprintf (ptr, remaining, "icy%s:%s\r\n",
-                                        var->name + 3, var->value);
-                    }
-                    else 
-                        if (!strncasecmp ("icy-", var->name, 4))
-                        {
-                            bytes = snprintf (ptr, remaining, "icy%s:%s\r\n",
-                                    var->name + 3, var->value);
-                        }
-                }
-            }
-
-            remaining -= bytes;
-            ptr += bytes;
-            if (next)
-                node = avl_get_next (node);
-        }
-        avl_tree_unlock (plugin->parser->vars);
-    }
-
-    config = config_get_config();
-    bytes = snprintf (ptr, remaining, "Server: %s\r\n", config->server_id);
-    config_release_config();
-    remaining -= bytes;
-    ptr += bytes;
-
-    bytes = snprintf (ptr, remaining, "Cache-Control: no-cache, no-store\r\n"
-            "Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n"
-            "%s\r\n", client_keepalive_header (client));
-    remaining -= bytes;
-    ptr += bytes;
-
-    bytes = client_add_cors (client, ptr, remaining);
-    remaining -= bytes;
-    ptr += bytes;
-
-    client->refbuf->len = 4096 - remaining;
-    client->refbuf->flags |= WRITE_BLOCK_GENERIC;
     return 0;
 }
 
+
+/* Prepare headers
+ * If any error occurs in this function, return -1
+ * Do not send a error to the client using client_send_error
+ * here but instead set client->respcode to 500.
+ * Else client_send_error will destroy and free the client and all
+ * calling functions will use a already freed client struct and
+ * cause a segfault!
+ */
+static inline ssize_t __print_var(char *str, size_t remaining, const char *format, const char *first, const http_var_t *var)
+{
+    size_t i;
+    ssize_t done = 0;
+    int ret;
+
+    for (i = 0; i < var->values; i++) {
+        ret = snprintf(str + done, remaining - done, format, first, var->value[i]);
+        if (ret <= 0 || (size_t)ret >= (remaining - done))
+            return -1;
+
+        done += ret;
+    }
+
+    return done;
+}
+
+static inline const char *__find_bitrate(const http_var_t *var)
+{
+    size_t i;
+    const char *ret;
+
+    for (i = 0; i < var->values; i++) {
+        ret = strstr(var->value[i], "bitrate=");
+        if (ret)
+            return ret;
+    }
+
+    return NULL;
+}
+
+static int format_prepare_headers (source_t *source, client_t *client)
+{
+    size_t remaining;
+    char *ptr;
+    int bytes;
+    int bitrate_filtered = 0;
+    avl_node *node;
+
+    remaining = client->refbuf->len;
+    ptr = client->refbuf->data;
+    client->respcode = 200;
+
+    bytes = util_http_build_header(ptr, remaining, 0, 0, 200, NULL, source->format->contenttype, NULL, NULL, source, client);
+    if (bytes <= 0) {
+        ICECAST_LOG_ERROR("Dropping client as we can not build response headers.");
+        client->respcode = 500;
+        return -1;
+    } else if (((size_t)bytes + (size_t)1024U) >= remaining) { /* we don't know yet how much to follow but want at least 1kB free space */
+        void *new_ptr = realloc(ptr, bytes + 1024);
+        if (new_ptr) {
+            ICECAST_LOG_DEBUG("Client buffer reallocation succeeded.");
+            client->refbuf->data = ptr = new_ptr;
+            client->refbuf->len = remaining = bytes + 1024;
+            bytes = util_http_build_header(ptr, remaining, 0, 0, 200, NULL, source->format->contenttype, NULL, NULL, source, client);
+            if (bytes <= 0 || (size_t)bytes >= remaining) {
+                ICECAST_LOG_ERROR("Dropping client as we can not build response headers.");
+                client->respcode = 500;
+                return -1;
+            }
+        } else {
+            ICECAST_LOG_ERROR("Client buffer reallocation failed. Dropping client.");
+            client->respcode = 500;
+            return -1;
+        }
+    }
+
+    if (bytes <= 0 || (size_t)bytes >= remaining) {
+        ICECAST_LOG_ERROR("Can not allocate headers for client %p", client);
+        client->respcode = 500;
+        return -1;
+    }
+    remaining -= bytes;
+    ptr += bytes;
+
+    /* iterate through source http headers and send to client */
+    avl_tree_rlock(source->parser->vars);
+    node = avl_get_first(source->parser->vars);
+    while (node)
+    {
+        int next = 1;
+        http_var_t *var = (http_var_t *) node->key;
+        bytes = 0;
+        if (!strcasecmp(var->name, "ice-audio-info"))
+        {
+            /* convert ice-audio-info to icy-br */
+            const char *brfield = NULL;
+            unsigned int bitrate;
+
+            if (bitrate_filtered == 0)
+                brfield = __find_bitrate(var);
+            if (brfield && sscanf (brfield, "bitrate=%u", &bitrate))
+            {
+                bytes = snprintf (ptr, remaining, "icy-br:%u\r\n", bitrate);
+                next = 0;
+                bitrate_filtered = 1;
+            }
+            else
+                /* show ice-audio_info header as well because of relays */
+                bytes = __print_var(ptr, remaining, "%s: %s\r\n", var->name, var);
+        }
+        else
+        {
+            if (strcasecmp(var->name, "ice-password") &&
+                strcasecmp(var->name, "icy-metaint"))
+            {
+                if (!strcasecmp(var->name, "ice-name"))
+                {
+                    ice_config_t *config;
+                    mount_proxy *mountinfo;
+
+                    config = config_get_config();
+                    mountinfo = config_find_mount (config, source->mount, MOUNT_TYPE_NORMAL);
+
+                    if (mountinfo && mountinfo->stream_name)
+                        bytes = snprintf (ptr, remaining, "icy-name:%s\r\n", mountinfo->stream_name);
+                    else
+                        bytes = __print_var(ptr, remaining, "icy-%s:%s\r\n", "name", var);
+
+                    config_release_config();
+                }
+                else if (!strncasecmp("ice-", var->name, 4))
+                {
+                    if (!strcasecmp("ice-public", var->name))
+                        bytes = __print_var(ptr, remaining, "icy-%s:%s\r\n", "pub", var);
+                    else
+                        if (!strcasecmp ("ice-bitrate", var->name))
+                            bytes = __print_var(ptr, remaining, "icy-%s:%s\r\n", "br", var);
+                        else
+                            bytes = __print_var(ptr, remaining, "icy%s:%s\r\n", var->name + 3, var);
+                }
+                else
+                    if (!strncasecmp("icy-", var->name, 4))
+                    {
+                        bytes = __print_var(ptr, remaining, "icy%s:%s\r\n", var->name + 3, var);
+                    }
+            }
+        }
+
+        if (bytes < 0 || (size_t)bytes >= remaining) {
+            avl_tree_unlock(source->parser->vars);
+            ICECAST_LOG_ERROR("Can not allocate headers for client %p", client);
+            client->respcode = 500;
+            return -1;
+        }
+
+        remaining -= bytes;
+        ptr += bytes;
+        if (next)
+            node = avl_get_next(node);
+    }
+    avl_tree_unlock(source->parser->vars);
+
+    bytes = snprintf(ptr, remaining, "\r\n");
+    if (bytes <= 0 || (size_t)bytes >= remaining) {
+        ICECAST_LOG_ERROR("Can not allocate headers for client %p", client);
+        client->respcode = 500;
+        return -1;
+    }
+    remaining -= bytes;
+    ptr += bytes;
+
+    client->refbuf->len -= remaining;
+    if (source->format->create_client_data)
+        if (source->format->create_client_data (source, client) < 0) {
+            ICECAST_LOG_ERROR("Client format header generation failed. "
+                "(Likely not enough or wrong source data) Dropping client.");
+            client->respcode = 500;
+            return -1;
+        }
+    return 0;
+}
+
+void format_set_vorbiscomment(format_plugin_t *plugin, const char *tag, const char *value) {
+    if (vorbis_comment_query_count(&plugin->vc, tag) != 0) {
+        /* delete key */
+        /* as libvorbis hides away all the memory functions we need to copy
+         * the structure comment by comment. sorry about that...
+         */
+        vorbis_comment vc;
+        int i; /* why does vorbis_comment use int, not size_t? */
+        size_t keylen = strlen(tag);
+
+        vorbis_comment_init(&vc);
+        /* copy tags */
+        for (i = 0; i < plugin->vc.comments; i++) {
+            if (strncasecmp(plugin->vc.user_comments[i], tag, keylen) == 0 && plugin->vc.user_comments[i][keylen] == '=')
+                continue;
+            vorbis_comment_add(&vc, plugin->vc.user_comments[i]);
+        }
+        /* move vendor */
+        vc.vendor = plugin->vc.vendor;
+        plugin->vc.vendor = NULL;
+        vorbis_comment_clear(&plugin->vc);
+        plugin->vc = vc;
+    }
+    vorbis_comment_add_tag(&plugin->vc, tag, value);
+}

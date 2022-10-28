@@ -3,11 +3,12 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
+ * Copyright 2013-2018, Philipp "ph3-der-loewe" Schafft <lion@lion.leolix.org>,
  */
 
 /* -*- c-basic-offset: 4; indent-tabs-mode: nil; -*- */
@@ -18,25 +19,24 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <curl/curl.h>
 
-#ifdef HAVE_STRINGS_H
-#include <strings.h>
-#endif
+#include "common/thread/thread.h"
 
-#include "thread/thread.h"
-
-#include "connection.h"
-#include "refbuf.h"
-#include "client.h"
+#include "yp.h"
+#include "global.h"
+#include "curl.h"
 #include "logging.h"
-#include "format.h"
 #include "source.h"
 #include "cfgfile.h"
 #include "stats.h"
-#include "global.h"
+#include "listensocket.h"
+#include "prng.h"
 
-#define CATMODULE "yp" 
+#ifdef WIN32
+#define snprintf _snprintf
+#endif
+
+#define CATMODULE "yp"
 
 struct yp_server
 {
@@ -45,6 +45,7 @@ struct yp_server
     unsigned    url_timeout;
     unsigned    touch_interval;
     int         remove;
+    char        *listen_socket_id;
 
     CURL *curl;
     struct ypdata_tag *mounts, *pending_mounts;
@@ -75,113 +76,79 @@ typedef struct ypdata_tag
     char *subtype;
 
     struct yp_server *server;
-    time_t      next_update;
-    unsigned    touch_interval;
-    char        *error_msg;
-    int         (*process)(struct ypdata_tag *yp, char *s, unsigned len);
+    time_t next_update;
+    unsigned touch_interval;
+    char *error_msg;
+    int (*process)(struct ypdata_tag *yp, char *s, unsigned len);
 
     struct ypdata_tag *next;
 } ypdata_t;
 
 
-typedef struct _yp_change_t
-{
-   char *mount;
-   void (*callback) (struct _yp_change_t *);
-   void *extra;
-   struct _yp_change_t *next;
-} yp_change_t;
-
-
-yp_change_t **yp_changes, *yp_changes_head;
-int yp_pending_thread;
 static rwlock_t yp_lock;
 static mutex_t yp_pending_lock;
-int yp_initialised;
 
 static volatile struct yp_server *active_yps = NULL, *pending_yps = NULL;
 static volatile int yp_update = 0;
+static int yp_running;
 static time_t now;
-static volatile thread_type *yp_thread;
+static thread_type *yp_thread;
 static volatile unsigned client_limit = 0;
 static volatile char *server_version = NULL;
 
 static void *yp_update_thread(void *arg);
-static void add_yp_info (ypdata_t *yp, void *info, int type);
-static int do_yp_remove (ypdata_t *yp, char *s, unsigned len);
-static int do_yp_add (ypdata_t *yp, char *s, unsigned len);
-static int do_yp_touch (ypdata_t *yp, char *s, unsigned len);
+static void add_yp_info(ypdata_t *yp, void *info, int type);
+static int do_yp_remove(ypdata_t *yp, char *s, unsigned len);
+static int do_yp_add(ypdata_t *yp, char *s, unsigned len);
+static int do_yp_touch(ypdata_t *yp, char *s, unsigned len);
+static void add_pending_yp (struct yp_server *server);
+static void delete_marked_yp(struct yp_server *server);
 static void yp_destroy_ypdata(ypdata_t *ypdata);
-static int  directory_recheck (client_t *client);
-
-
-struct _client_functions directory_client_ops =
-{
-    directory_recheck,
-    NULL
-};
-
-static client_t ypclient;
 
 
 /* curl callback used to parse headers coming back from the YP server */
-static size_t response_header (void *ptr, size_t size, size_t nmemb, void *stream)
+static size_t handle_returned_header (void *ptr, size_t size, size_t nmemb, void *stream)
 {
     ypdata_t *yp = stream;
-    unsigned bytes = size * nmemb;
+    size_t bytes = size * nmemb;
 
-    // DEBUG2 ("header from YP is \"%.*s\"", bytes, (char*)ptr);
-    if (strncasecmp (ptr, "YPResponse:", 11) == 0)
-    {
-        unsigned resp = 0;
-        sscanf (ptr+11, "%u", &resp);
-        if (resp == 1)
-            yp->cmd_ok = resp;
-    }
+    prng_write(ptr, bytes);
 
-    if (strncasecmp (ptr, "YPMessage:", 10) == 0)
+    /* ICECAST_LOG_DEBUG("header from YP is \"%.*s\"", bytes, ptr); */
+    if (strncasecmp (ptr, "YPResponse: 1", 13) == 0)
+        yp->cmd_ok = 1;
+
+    if (strncasecmp (ptr, "YPMessage: ", 11) == 0)
     {
-        unsigned len = bytes - 10;
+        size_t len = bytes - 11;
         free (yp->error_msg);
         yp->error_msg = calloc (1, len);
         if (yp->error_msg)
-        {
-            sscanf (ptr+10, " %[^\r\n]", yp->error_msg);
-            INFO2 ("message for %s, %s", yp->mount, yp->error_msg);
-        }
+            sscanf (ptr + 11, "%[^\r\n]", yp->error_msg);
     }
 
     if (yp->process == do_yp_add)
     {
-        if (strncasecmp (ptr, "SID:", 4) == 0)
+        if (strncasecmp (ptr, "SID: ", 5) == 0)
         {
-            unsigned len = bytes - 4;
+            size_t len = bytes - 5;
             free (yp->sid);
             yp->sid = calloc (1, len);
             if (yp->sid)
-                sscanf (ptr+4, " %[^\r\n]", yp->sid);
+                sscanf (ptr + 5, "%[^\r\n]", yp->sid);
         }
     }
-    if (strncasecmp (ptr, "TouchFreq:", 10) == 0)
+    if (strncasecmp (ptr, "TouchFreq: ", 11) == 0)
     {
-        unsigned secs = 300;
-        sscanf (ptr+10, "%u", &secs);
+        unsigned secs;
+        if ( sscanf (ptr + 11, "%u", &secs) != 1 )
+            secs = 0;
         if (secs < 30)
             secs = 30;
-        if (yp->touch_interval != secs)
-        {
-            INFO2 ("touch interval for %s set to %u", yp->mount, secs);
-            yp->touch_interval = secs;
-        }
+        ICECAST_LOG_DEBUG("server touch interval is %u", secs);
+        yp->touch_interval = secs;
     }
-    return (int)bytes;
-}
-
-
-/* capture returned data, but don't do anything with it, shouldn't be any */
-static size_t handle_returned_data (void *ptr, size_t size, size_t nmemb, void *stream)
-{
-    return (int)(size*nmemb);
+    return (size_t)bytes;
 }
 
 
@@ -210,73 +177,33 @@ static struct yp_server *find_yp_server (const char *url)
 
 static void destroy_yp_server (struct yp_server *server)
 {
+    ypdata_t *yp;
+
     if (server == NULL)
         return;
-    DEBUG1 ("Removing YP server entry for %s", server->url);
-    if (server->curl)
-        curl_easy_cleanup (server->curl);
-    if (server->mounts) WARN0 ("active ypdata not freed up");
-    if (server->pending_mounts) WARN0 ("pending ypdata not freed up");
+    ICECAST_LOG_DEBUG("Removing YP server entry for %s", server->url);
+
+    /* delete yps:
+     * first move all pendings into main queue.
+     * then mark all main queue entries for deleting.
+     * then remove all marked entries.
+     */
+    add_pending_yp(server);
+    yp = server->mounts;
+    while (yp) {
+        yp->remove = 1;
+        yp = yp->next;
+    }
+    delete_marked_yp(server);
+
+    icecast_curl_free(server->curl);
+    if (server->mounts) ICECAST_LOG_WARN("active ypdata not freed");
+    if (server->pending_mounts) ICECAST_LOG_WARN("pending ypdata not freed");
     free (server->url);
     free (server->server_id);
     free (server);
 }
 
-
-static void yp_schedule (ypdata_t *yp, unsigned offset)
-{
-    time_t when = ypclient.worker->current_time.tv_sec + offset;
-    yp->next_update = when;
-    if ((uint64_t)when < ypclient.counter)
-        ypclient.counter = (uint64_t)when;
-}
-
-
-static int directory_recheck (client_t *client)
-{
-    int ret = -1;
-
-    if (thread_rwlock_tryrlock (&yp_lock) < 0)
-    {
-        client->schedule_ms = client->worker->time_ms + 300;
-        return 0;
-    }
-    do {
-        if (ypclient.connection.error)
-            break;
-        if (active_yps || yp_update)
-        {
-            ret = 0;
-            if (yp_update || active_yps->mounts)
-            {
-                if (yp_update || client->counter <= client->worker->current_time.tv_sec)
-                {
-                    client->counter = (uint64_t)-1;
-                    client->flags &= ~CLIENT_ACTIVE;
-                    thread_create ("YP Thread", yp_update_thread, NULL, THREAD_DETACHED);
-                    break;
-                }
-            }
-        }
-        client->schedule_ms = client->worker->time_ms + 1000;
-    } while (0);
-    thread_rwlock_unlock (&yp_lock);
-    return ret;
-}
-
-
-static void yp_client_add (ice_config_t *config)
-{
-    if (config->num_yp_directories == 0 || active_yps || global.running != ICE_RUNNING)
-        return;
-    INFO0 ("Starting Directory client for YP processing");
-    ypclient.ops = &directory_client_ops;
-    ypclient.counter = 0;
-    ypclient.schedule_ms = 0;
-    ypclient.connection.error = 0;
-    ypclient.flags = CLIENT_ACTIVE|CLIENT_SKIP_ACCESSLOG;
-    client_add_worker (&ypclient);
-}
 
 
 /* search for a ypdata entry corresponding to a specific mountpoint */
@@ -295,10 +222,9 @@ static ypdata_t *find_yp_mount (ypdata_t *mounts, const char *mount)
 
 void yp_recheck_config (ice_config_t *config)
 {
-    int i;
     struct yp_server *server;
 
-    DEBUG0("Updating YP configuration");
+    ICECAST_LOG_DEBUG("Updating YP configuration");
     thread_rwlock_rlock (&yp_lock);
 
     server = (struct yp_server *)active_yps;
@@ -310,42 +236,39 @@ void yp_recheck_config (ice_config_t *config)
     client_limit = config->client_limit;
     free ((char*)server_version);
     server_version = strdup (config->server_id);
-    /* for each yp url in config, check to see if one exists 
+    /* for each yp url in config, check to see if one exists
        if not, then add it. */
-    for (i=0 ; i < config->num_yp_directories; i++)
+    for (yp_directory_t *yp = config->yp_directories; yp; yp = yp->next)
     {
-        server = find_yp_server (config->yp_url[i]);
+        server = find_yp_server (yp->url);
         if (server == NULL)
         {
             server = calloc (1, sizeof (struct yp_server));
 
             if (server == NULL)
+            {
+                destroy_yp_server (server);
                 break;
+            }
             server->server_id = strdup ((char *)server_version);
-            server->url = strdup (config->yp_url[i]);
-            server->url_timeout = config->yp_url_timeout[i];
-            server->touch_interval = config->yp_touch_interval[i];
-            server->curl = curl_easy_init();
+            server->url = strdup (yp->url);
+            server->url_timeout = yp->timeout;
+            server->touch_interval = yp->touch_interval;
+            server->listen_socket_id = yp->listen_socket_id;
+            server->curl = icecast_curl_new(server->url, &(server->curl_error[0]));
             if (server->curl == NULL)
             {
                 destroy_yp_server (server);
                 break;
             }
+            if (server->url_timeout > 10 || server->url_timeout < 1)
+                server->url_timeout = 6;
             if (server->touch_interval < 30)
                 server->touch_interval = 30;
-            curl_easy_setopt (server->curl, CURLOPT_USERAGENT, server->server_id);
-            curl_easy_setopt (server->curl, CURLOPT_URL, server->url);
-            curl_easy_setopt (server->curl, CURLOPT_HEADERFUNCTION, response_header);
-            curl_easy_setopt (server->curl, CURLOPT_WRITEFUNCTION, handle_returned_data);
-            curl_easy_setopt (server->curl, CURLOPT_WRITEDATA, server->curl);
-            curl_easy_setopt (server->curl, CURLOPT_TIMEOUT, server->url_timeout);
-            curl_easy_setopt (server->curl, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt (server->curl, CURLOPT_FOLLOWLOCATION, 1L);
-            curl_easy_setopt (server->curl, CURLOPT_MAXREDIRS, 3L);
-            curl_easy_setopt (server->curl, CURLOPT_ERRORBUFFER, &(server->curl_error[0]));
+            curl_easy_setopt (server->curl, CURLOPT_HEADERFUNCTION, handle_returned_header);
             server->next = (struct yp_server *)pending_yps;
             pending_yps = server;
-            INFO3 ("Adding new YP server \"%s\" (timeout %ds, default interval %ds)",
+            ICECAST_LOG_INFO("Adding new YP server \"%s\" (timeout %ds, default interval %ds)",
                     server->url, server->url_timeout, server->touch_interval);
         }
         else
@@ -353,21 +276,22 @@ void yp_recheck_config (ice_config_t *config)
             server->remove = 0;
         }
     }
-    yp_update = 1;
-    yp_client_add (config);
     thread_rwlock_unlock (&yp_lock);
+    thread_rwlock_wlock(&yp_lock);
+    yp_update = 1;
+    thread_rwlock_unlock(&yp_lock);
 }
 
 
-void yp_initialize (ice_config_t *config)
+void yp_initialize(void)
 {
+    ice_config_t *config = config_get_config();
     thread_rwlock_create (&yp_lock);
     thread_mutex_create (&yp_pending_lock);
     yp_recheck_config (config);
-    yp_changes_head = NULL;
-    yp_changes = &yp_changes_head;
-    yp_pending_thread = 0;
-    yp_initialised = 1;
+    config_release_config ();
+    yp_thread = thread_create("YP Touch Thread", yp_update_thread,
+                            (void *)NULL, THREAD_ATTACHED);
 }
 
 
@@ -381,7 +305,7 @@ static int send_to_yp (const char *cmd, ypdata_t *yp, char *post)
     int curlcode;
     struct yp_server *server = yp->server;
 
-    // DEBUG2 ("send YP (%s):%s", cmd, post);
+    /* ICECAST_LOG_DEBUG("send YP (%s):%s", cmd, post); */
     yp->cmd_ok = 0;
     curl_easy_setopt (server->curl, CURLOPT_POSTFIELDS, post);
     curl_easy_setopt (server->curl, CURLOPT_WRITEHEADER, yp);
@@ -389,8 +313,8 @@ static int send_to_yp (const char *cmd, ypdata_t *yp, char *post)
     if (curlcode)
     {
         yp->process = do_yp_add;
-        yp_schedule (yp, 1200);
-        ERROR3 ("connection to %s failed on %s with \"%s\"", server->url, yp->mount, server->curl_error);
+        yp->next_update = now + 1200;
+        ICECAST_LOG_ERROR("connection to %s failed with \"%s\"", server->url, server->curl_error);
         return -2;
     }
     if (yp->cmd_ok == 0)
@@ -399,8 +323,8 @@ static int send_to_yp (const char *cmd, ypdata_t *yp, char *post)
             yp->error_msg = strdup ("no response from server");
         if (yp->process == do_yp_add)
         {
-            ERROR4 ("YP %s on %s failed for %s: %s", cmd, server->url, yp->mount, yp->error_msg);
-            yp_schedule (yp, 7200);
+            ICECAST_LOG_ERROR("YP %s on %s failed: %s", cmd, server->url, yp->error_msg);
+            yp->next_update = now + 7200;
         }
         if (yp->process == do_yp_touch)
         {
@@ -411,19 +335,17 @@ static int send_to_yp (const char *cmd, ypdata_t *yp, char *post)
              * cases as a firewall block or incorrect listenurl.
              */
             if (yp->touch_interval < 1200)
-                yp_schedule (yp, 1200);
+                yp->next_update = now + 1200;
             else
-                yp_schedule (yp, yp->touch_interval);
-            INFO4 ("YP %s on %s failed for %s: %s", cmd, server->url, yp->mount, yp->error_msg);
+                yp->next_update = now + yp->touch_interval;
+            ICECAST_LOG_INFO("YP %s on %s failed: %s", cmd, server->url, yp->error_msg);
         }
         yp->process = do_yp_add;
-        free (yp->sid);
+        free(yp->sid);
         yp->sid = NULL;
-        free (yp->error_msg);
-        yp->error_msg = NULL;
         return -1;
     }
-    DEBUG3 ("YP %s at %s for %s succeeded", cmd, server->url, yp->mount);
+    ICECAST_LOG_DEBUG("YP %s at %s succeeded", cmd, server->url);
     return 0;
 }
 
@@ -439,7 +361,7 @@ static int do_yp_remove (ypdata_t *yp, char *s, unsigned len)
         if (ret >= (signed)len)
             return ret+1;
 
-        INFO1 ("clearing up YP entry for %s", yp->mount);
+        ICECAST_LOG_INFO("clearing up YP entry for %s", yp->mount);
         ret = send_to_yp ("remove", yp, s);
         free (yp->sid);
         yp->sid = NULL;
@@ -452,47 +374,22 @@ static int do_yp_remove (ypdata_t *yp, char *s, unsigned len)
 }
 
 
-/* the incoming rate can vary a fair bit so to get the expected value I add about 10%
- * (to handle lower figures) and then refer to the most significant 3 bits using shift
- * ops.  This should give us a resoanble estimation for YP
- */
-static void set_bitrate_from_inrate (ypdata_t *yp)
-{
-    char *value = stats_get_value (yp->mount, "incoming_bitrate");
-    if (value)
-    {
-        long v = atol (value), c = 0;
-        char buf [12];
-
-        v = (long)(v*1.1) + 5;
-        for (; v > 7; c++)
-            v >>= 1;
-        v <<= c;
-        v /= 1024;
-        snprintf (buf, sizeof buf, "%ld", v);
-        add_yp_info (yp, buf, YP_BITRATE);
-        free (value);
-    }
-}
-
-
 static int do_yp_add (ypdata_t *yp, char *s, unsigned len)
 {
     int ret;
     char *value;
+    ice_config_t *config;
+    char *admin;
+
+    config = config_get_config();
+    admin = util_url_escape(config->admin);
+    config_release_config();
 
     value = stats_get_value (yp->mount, "server_type");
     add_yp_info (yp, value, YP_SERVER_TYPE);
     free (value);
 
     value = stats_get_value (yp->mount, "server_name");
-    if (value == NULL || strcasecmp (value, "Unspecified name") == 0)
-    {
-        INFO1 ("mount %s requires valid name", yp->mount);
-        yp_schedule (yp, 600);
-        free (value);
-        return 0;
-    }
     add_yp_info (yp, value, YP_SERVER_NAME);
     free (value);
 
@@ -504,14 +401,11 @@ static int do_yp_add (ypdata_t *yp, char *s, unsigned len)
     add_yp_info (yp, value, YP_SERVER_GENRE);
     free (value);
 
-    value = stats_get_value (yp->mount, "bitrate");
-    if (value)
-    {
-        add_yp_info (yp, value, YP_BITRATE);
-        free (value);
-    }
-    else
-        set_bitrate_from_inrate (yp);
+    value = stats_get_value (yp->mount, "audio_bitrate");
+    if (value == NULL)
+        value = stats_get_value (yp->mount, "ice-bitrate");
+    add_yp_info (yp, value, YP_BITRATE);
+    free (value);
 
     value = stats_get_value (yp->mount, "server_description");
     add_yp_info (yp, value, YP_SERVER_DESC);
@@ -525,17 +419,14 @@ static int do_yp_add (ypdata_t *yp, char *s, unsigned len)
     add_yp_info (yp, value, YP_AUDIO_INFO);
     free (value);
 
-    if (yp->server_name[0] == 0 || yp->server_genre[0] == 0 || yp->server_type[0] == 0 || yp->bitrate[0] == 0)
-    {
-        INFO1 ("mount %s requires stats (sn, genre, type, bitrate)", yp->mount);
-        yp_schedule (yp, 600);
-        return -1;
-    }
-    ret = snprintf (s, len, "action=add&sn=%s&genre=%s&cpswd=%s&desc="
+    ret = snprintf (s, len, "action=add&admin=%s&sn=%s&genre=%s&cpswd=%s&desc="
                     "%s&url=%s&listenurl=%s&type=%s&stype=%s&b=%s&%s\r\n",
+                    admin,
                     yp->server_name, yp->server_genre, yp->cluster_password,
                     yp->server_desc, yp->url, yp->listen_url,
                     yp->server_type, yp->subtype, yp->bitrate, yp->audio_info);
+    free(admin);
+
     if (ret >= (signed)len)
         return ret+1;
     ret = send_to_yp ("add", yp, s);
@@ -543,7 +434,7 @@ static int do_yp_add (ypdata_t *yp, char *s, unsigned len)
     {
         yp->process = do_yp_touch;
         /* force first touch in 5 secs */
-        yp_schedule (yp, 5);
+        yp->next_update = time(NULL) + 5;
     }
     return ret;
 }
@@ -552,14 +443,33 @@ static int do_yp_add (ypdata_t *yp, char *s, unsigned len)
 static int do_yp_touch (ypdata_t *yp, char *s, unsigned len)
 {
     unsigned listeners = 0, max_listeners = 1;
-    char *val;
+    char *val, *artist, *title;
     int ret;
 
-    if (yp->sid == NULL) // odd case, go back to add, try get another sid.
+    artist = (char *)stats_get_value (yp->mount, "artist");
+    title = (char *)stats_get_value (yp->mount, "title");
+    if (artist || title)
     {
-        yp->process = do_yp_touch;
-        yp_schedule (yp, 60);
+         char *song;
+         const char *separator = " - ";
+         if (artist == NULL)
+         {
+             artist = strdup("");
+             separator = "";
+         }
+         if (title == NULL) title = strdup("");
+         song = malloc (strlen (artist) + strlen (title) + strlen (separator) +1);
+         if (song)
+         {
+             sprintf (song, "%s%s%s", artist, separator, title);
+             add_yp_info(yp, song, YP_CURRENT_SONG);
+             stats_event (yp->mount, "yp_currently_playing", song);
+             free (song);
+         }
     }
+    free (artist);
+    free (title);
+
     val = (char *)stats_get_value (yp->mount, "listeners");
     if (val)
     {
@@ -587,17 +497,17 @@ static int do_yp_touch (ypdata_t *yp, char *s, unsigned len)
     if (ret >= (signed)len)
         return ret+1; /* space required for above text and nul*/
 
-    ret = send_to_yp ("touch", yp, s);
-    if (ret == 0)
+    if (send_to_yp ("touch", yp, s) == 0)
     {
-        yp_schedule (yp, yp->touch_interval);
+        yp->next_update = now + yp->touch_interval;
+        return 0;
     }
-    return ret;
+    return -1;
 }
 
 
 
-static int process_ypdata (struct yp_server *server, ypdata_t *yp)
+static int process_ypdata(struct yp_server *server, ypdata_t *yp)
 {
     unsigned len = 1024;
     char *s = NULL, *tmp;
@@ -609,21 +519,21 @@ static int process_ypdata (struct yp_server *server, ypdata_t *yp)
     while (1)
     {
         int ret;
-        if ((tmp = realloc (s, len)) == NULL)
+        if ((tmp = realloc(s, len)) == NULL)
             return 0;
         s = tmp;
 
         if (yp->release)
         {
             yp->process = do_yp_remove;
-            yp_schedule (yp, 0);
+            yp->next_update = 0;
         }
 
         ret = yp->process (yp, s, len);
         if (ret <= 0)
         {
-            free (s);
-            return ret;
+           free (s);
+           return ret;
         }
         len = ret;
     }
@@ -634,58 +544,46 @@ static int process_ypdata (struct yp_server *server, ypdata_t *yp)
 static void yp_process_server (struct yp_server *server)
 {
     ypdata_t *yp;
-    int error = 0, within_limit = 20;
+    int state = 0;
 
-    /* DEBUG1("processing yp server %s", server->url); */
+    /* ICECAST_LOG_DEBUG("processing yp server %s", server->url); */
     yp = server->mounts;
-    now = time(NULL);
     while (yp)
     {
+        now = time (NULL);
         /* if one of the streams shows that the server cannot be contacted then mark the
-         * other entries for an update later. Assume YP server is stuck and skip it for now
+         * other entries for an update later. Assume YP server is dead and skip it for now
          */
-        if (error == -2)
+        if (state == -2)
         {
-            static unsigned disperse = 0;
-            disperse++;
-            DEBUG2 ("skiping %s on %s", yp->mount, server->url);
+            ICECAST_LOG_DEBUG("skipping %s on %s", yp->mount, server->url);
             yp->process = do_yp_add;
-            yp_schedule (yp, 30 + (disperse%60));
+            yp->next_update += 900;
         }
-        else if (within_limit)
-        {
-            within_limit--;
-            if (now >= yp->next_update)
-            {
-                error = process_ypdata (server, yp);
-                if (error == -2)
-                    WARN1 ("error detected, backing off on %s", server->url);
-                now = time(NULL);
-            }
-        }
-        if (yp->remove == 0 && (uint64_t)yp->next_update < ypclient.counter)
-            ypclient.counter = (uint64_t)yp->next_update;
-
+        else
+            state = process_ypdata (server, yp);
         yp = yp->next;
     }
 }
 
 
 
-static ypdata_t *create_yp_entry (const char *mount)
+static ypdata_t *create_yp_entry (struct yp_server *server, const char *mount)
 {
     ypdata_t *yp;
-    char *s;
+
+    if (!server)
+        return NULL;
 
     yp = calloc (1, sizeof (ypdata_t));
     do
     {
+        listensocket_t *listen_socket = NULL;
         unsigned len = 512;
-        int ret;
+        ssize_t ret;
         char *url;
         mount_proxy *mountproxy = NULL;
         ice_config_t *config;
-        static int adjust = 0;
 
         if (yp == NULL)
             break;
@@ -705,16 +603,34 @@ static ypdata_t *create_yp_entry (const char *mount)
         url = malloc (len);
         if (url == NULL)
             break;
-        config = config_get_config();
-        ret = snprintf (url, len, "http://%s:%d%s", config->hostname, config->port, mount);
-        if (ret >= (signed)len)
-        {
-            s = realloc (url, ++ret);
-            if (s) url = s;
-            snprintf (url, ret, "http://%s:%d%s", config->hostname, config->port, mount);
-        }
 
-        mountproxy = config_find_mount (config, mount);
+        if (server->listen_socket_id) {
+            listen_socket = listensocket_container_get_by_id(global.listensockets,
+                                                             server->listen_socket_id);
+            if (!listen_socket)
+                ICECAST_LOG_ERROR("Failure to find listen socket with ID %#H, using default.",
+                    server->listen_socket_id);
+        }
+        ret = client_get_baseurl(NULL, listen_socket, url, len, NULL, NULL, NULL, mount, NULL);
+        if (ret >= len) {
+            // Buffer was too small, allocate a big enough one
+            char *s = realloc (url, ret + 1);
+            if (!s) {
+                refobject_unref(listen_socket);
+                free(url);
+                break;
+            }
+            url = s;
+
+            ret = client_get_baseurl(NULL, listen_socket, url, len, NULL, NULL, NULL, mount, NULL);
+        }
+        refobject_unref(listen_socket);
+
+        if (ret < 0 || ret >= len)
+            break;
+
+        config = config_get_config();
+        mountproxy = config_find_mount (config, mount, MOUNT_TYPE_NORMAL);
         if (mountproxy && mountproxy->cluster_password)
             add_yp_info (yp, mountproxy->cluster_password, YP_CLUSTER_PASSWORD);
         config_release_config();
@@ -724,8 +640,6 @@ static ypdata_t *create_yp_entry (const char *mount)
         if (yp->listen_url == NULL)
             break;
 
-        adjust++;
-        yp_schedule (yp, (adjust%30));
         return yp;
     } while (0);
 
@@ -745,10 +659,10 @@ static void check_servers (void)
         if (server->remove)
         {
             struct yp_server *to_go = server;
-            DEBUG1 ("YP server \"%s\"removed", server->url);
+            ICECAST_LOG_DEBUG("YP server \"%s\" removed", server->url);
             *server_p = server->next;
             server = server->next;
-            destroy_yp_server (to_go);
+            destroy_yp_server(to_go);
             continue;
         }
         server_p = &server->next;
@@ -762,7 +676,7 @@ static void check_servers (void)
         server = (struct yp_server *)pending_yps;
         pending_yps = server->next;
 
-        DEBUG1("Add pending yps %s", server->url);
+        ICECAST_LOG_DEBUG("Add pending yps %s", server->url);
         server->next = (struct yp_server *)active_yps;
         active_yps = server;
 
@@ -774,16 +688,13 @@ static void check_servers (void)
             ypdata_t *yp;
 
             source_t *source = node->key;
-            thread_rwlock_rlock (&source->lock);
-            if (source->yp_public && (yp = create_yp_entry (source->mount)) != NULL)
+            if (source->yp_public && (yp = create_yp_entry (server, source->mount)) != NULL)
             {
-                DEBUG1 ("Adding existing mount %s", source->mount);
-                yp->server = server;
+                ICECAST_LOG_DEBUG("Adding existing mount %s", source->mount);
                 yp->touch_interval = server->touch_interval;
                 yp->next = server->mounts;
                 server->mounts = yp;
             }
-            thread_rwlock_unlock (&source->lock);
             node = avl_get_next (node);
         }
         avl_tree_unlock (global.source_tree);
@@ -809,13 +720,12 @@ static void add_pending_yp (struct yp_server *server)
             break;
         yp = yp->next;
     }
-    ypclient.counter = 0;
     yp->next = current;
-    DEBUG2 ("%u YP entries added to %s", count, server->url);
+    ICECAST_LOG_DEBUG("%u YP entries added to %s", count, server->url);
 }
 
 
-static void delete_marked_yp (struct yp_server *server)
+static void delete_marked_yp(struct yp_server *server)
 {
     ypdata_t *yp = server->mounts, **prev = &server->mounts;
 
@@ -824,10 +734,10 @@ static void delete_marked_yp (struct yp_server *server)
         if (yp->remove)
         {
             ypdata_t *to_go = yp;
-            DEBUG2 ("removed %s from YP server %s", yp->mount, server->url);
+            ICECAST_LOG_DEBUG("removed %s from YP server %s", yp->mount, server->url);
             *prev = yp->next;
             yp = yp->next;
-            yp_destroy_ypdata (to_go);
+            yp_destroy_ypdata(to_go);
             continue;
         }
         prev = &yp->next;
@@ -838,44 +748,54 @@ static void delete_marked_yp (struct yp_server *server)
 
 static void *yp_update_thread(void *arg)
 {
-    struct yp_server *server;
+    ICECAST_LOG_INFO("YP update thread started");
+    int running;
 
-    yp_thread = thread_self();
-    /* DEBUG0("YP thread started"); */
+    yp_running = 1;
+    running = 1;
 
-    /* do the YP communication */
-    thread_rwlock_rlock (&yp_lock);
-    server = (struct yp_server *)active_yps;
-    while (server)
-    {
-        /* DEBUG1 ("trying %s", server->url); */
-        yp_process_server (server);
-        server = server->next;
-    }
-    thread_rwlock_unlock (&yp_lock);
+    while (running) {
+        struct yp_server *server;
 
-    /* update the local YP structure */
-    if (yp_update)
-    {
-        thread_rwlock_wlock (&yp_lock);
-        check_servers ();
+        thread_sleep (200000);
+
+        /* do the YP communication */
+        thread_rwlock_rlock (&yp_lock);
         server = (struct yp_server *)active_yps;
         while (server)
         {
-            /* DEBUG1 ("Checking yps %s", server->url); */
-            add_pending_yp (server);
-            delete_marked_yp (server);
+            /* ICECAST_LOG_DEBUG("trying %s", server->url); */
+            yp_process_server (server);
             server = server->next;
         }
-        yp_update = 0;
-        thread_rwlock_unlock (&yp_lock);
+        /* update the local YP structure */
+        if (yp_update)
+        {
+            thread_rwlock_unlock(&yp_lock);
+            thread_rwlock_wlock (&yp_lock);
+            check_servers ();
+            server = (struct yp_server *)active_yps;
+            while (server)
+            {
+                /* ICECAST_LOG_DEBUG("Checking yps %s", server->url); */
+                add_pending_yp (server);
+                delete_marked_yp (server);
+                server = server->next;
+            }
+            yp_update = 0;
+        }
+        running = yp_running;
+        thread_rwlock_unlock(&yp_lock);
     }
-    yp_thread = NULL;
-    /* DEBUG0("YP thread shutdown"); */
-
-    ypclient.schedule_ms = ypclient.worker->time_ms + 1000;
-    ypclient.flags |= CLIENT_ACTIVE;
-    worker_wakeup (ypclient.worker);
+    thread_rwlock_destroy (&yp_lock);
+    thread_mutex_destroy (&yp_pending_lock);
+    /* free server and ypdata left */
+    while (active_yps)
+    {
+        struct yp_server *server = (struct yp_server *)active_yps;
+        active_yps = server->next;
+        destroy_yp_server (server);
+    }
 
     return NULL;
 }
@@ -886,10 +806,10 @@ static void yp_destroy_ypdata(ypdata_t *ypdata)
 {
     if (ypdata) {
         if (ypdata->mount) {
-            free (ypdata->mount);
+            free(ypdata->mount);
         }
         if (ypdata->url) {
-            free (ypdata->url);
+            free(ypdata->url);
         }
         if (ypdata->sid) {
             free(ypdata->sid);
@@ -921,13 +841,13 @@ static void yp_destroy_ypdata(ypdata_t *ypdata)
         if (ypdata->audio_info) {
             free(ypdata->audio_info);
         }
-        free (ypdata->subtype);
-        free (ypdata->error_msg);
-        free (ypdata);
+        free(ypdata->subtype);
+        free(ypdata->error_msg);
+        free(ypdata);
     }
 }
 
-static void add_yp_info (ypdata_t *yp, void *info, int type)
+static void add_yp_info(ypdata_t *yp, void *info, int type)
 {
     char *escaped;
 
@@ -987,11 +907,15 @@ static void add_yp_info (ypdata_t *yp, void *info, int type)
 
 
 /* Add YP entries to active servers */
-static void yp_add_callback (yp_change_t *yp_change)
+void yp_add (const char *mount)
 {
     struct yp_server *server;
-    const char *mount = yp_change->mount;
 
+    /* make sure YP thread is not modifying the lists */
+    thread_rwlock_rlock (&yp_lock);
+
+    /* make sure we don't race against another yp_add */
+    thread_mutex_lock (&yp_pending_lock);
     server = (struct yp_server *)active_yps;
     while (server)
     {
@@ -1002,10 +926,10 @@ static void yp_add_callback (yp_change_t *yp_change)
         if (yp == NULL)
         {
             /* add new ypdata to each servers pending yp */
-            yp = create_yp_entry (mount);
+            yp = create_yp_entry (server, mount);
             if (yp)
             {
-                DEBUG2 ("Adding %s to %s", mount, server->url);
+                ICECAST_LOG_DEBUG("Adding %s to %s", mount, server->url);
                 yp->server = server;
                 yp->touch_interval = server->touch_interval;
                 yp->next = server->pending_mounts;
@@ -1015,19 +939,21 @@ static void yp_add_callback (yp_change_t *yp_change)
             }
         }
         else
-            DEBUG1 ("YP entry %s already exists", mount);
+            ICECAST_LOG_DEBUG("YP entry %s already exists", mount);
         server = server->next;
     }
+    thread_mutex_unlock (&yp_pending_lock);
+    thread_rwlock_unlock (&yp_lock);
 }
 
 
 
 /* Mark an existing entry in the YP list as to be marked for deletion */
-static void yp_remove_callback (yp_change_t *yp_change)
+void yp_remove (const char *mount)
 {
     struct yp_server *server = (struct yp_server *)active_yps;
-    const char *mount = yp_change->mount;
 
+    thread_rwlock_rlock (&yp_lock);
     while (server)
     {
         ypdata_t *list = server->mounts;
@@ -1042,30 +968,30 @@ static void yp_remove_callback (yp_change_t *yp_change)
                 list = yp->next;
                 continue;   /* search again these are old entries */
             }
-            DEBUG2 ("release %s on YP %s", mount, server->url);
+            ICECAST_LOG_DEBUG("release %s on YP %s", mount, server->url);
             yp->release = 1;
             yp->next_update = 0;
-            yp_update = 1;
         }
         server = server->next;
     }
+    thread_rwlock_unlock (&yp_lock);
 }
 
 
 /* This is similar to yp_remove, but we force a touch
  * attempt */
-static void yp_touch_callback (yp_change_t *yp_change)
+void yp_touch (const char *mount)
 {
     struct yp_server *server = (struct yp_server *)active_yps;
     ypdata_t *search_list = NULL;
 
+    thread_rwlock_rlock (&yp_lock);
     if (server)
         search_list = server->mounts;
 
-    now = time(NULL);
     while (server)
     {
-        ypdata_t *yp = find_yp_mount (search_list, yp_change->mount);
+        ypdata_t *yp = find_yp_mount (search_list, mount);
         if (yp)
         {
             /* we may of found old entries not purged yet, so skip them */
@@ -1074,180 +1000,29 @@ static void yp_touch_callback (yp_change_t *yp_change)
                 search_list = yp->next;
                 continue;
             }
-            add_yp_info (yp, yp_change->extra, YP_CURRENT_SONG);
-            if (yp->process == do_yp_touch)
-            {
-                // update rules, prevent updates being too frequent, at least 30 seconds
-                if (yp->next_update - now > 30)
-                {
-                    if (now - 30 < yp->next_update - yp->touch_interval)
-                        yp_schedule (yp, 30);
-                    else
-                        yp_schedule (yp, 0);
-                }
-            }
+            /* don't update the directory if there is a touch scheduled soon */
+            if (yp->process == do_yp_touch && now + yp->touch_interval - yp->next_update > 60)
+                yp->next_update = now + 3;
         }
         server = server->next;
         if (server)
             search_list = server->mounts;
     }
-    free (yp_change->extra);
-    yp_change->extra = NULL;
-}
-
-
-static void *yp_pending_update (void *arg)
-{
-    yp_change_t *list;
-    thread_sleep (50000); // wait a little for a few more updaes to queue up
-    DEBUG0 ("running through YP changes");
-    thread_mutex_lock (&yp_pending_lock);
-    while (yp_changes_head)
-    {
-        int processed = 0;
-        // detaching the list allows lock drop, but we recheck it later
-        list = yp_changes_head;
-        yp_changes_head = NULL;
-        yp_changes = &yp_changes_head;
-        thread_mutex_unlock (&yp_pending_lock);
-
-        thread_rwlock_wlock (&yp_lock);
-        while (list)
-        {
-            yp_change_t *yp_change = list;
-            list = yp_change->next;
-            if (ypclient.connection.error == 0)
-                (*yp_change->callback) (yp_change);
-
-            free (yp_change->mount);
-            free (yp_change);
-            processed++;
-        }
-        thread_rwlock_unlock (&yp_lock);
-        DEBUG1 ("Processed %d changes", processed);
-        thread_mutex_lock (&yp_pending_lock);
-    }
-    yp_pending_thread = 0;
-    thread_mutex_unlock (&yp_pending_lock);
-    return NULL;
-}
-
-
-static void yp_queue_change (yp_change_t *change)
-{
-    if (global.running != ICE_RUNNING)
-    {
-        free (change->mount);
-        free (change);
-        return;
-    }
-    thread_mutex_lock (&yp_pending_lock);
-    if (change)
-    {
-        *yp_changes = change;
-        yp_changes = &change->next;
-    }
-    if (yp_pending_thread == 0)
-    {
-        yp_pending_thread = 1;
-        thread_create ("YP change", yp_pending_update, NULL, THREAD_DETACHED);
-    }
-    thread_mutex_unlock (&yp_pending_lock);
-}
-
-
-void yp_touch (const char *mount, long stats)
-{
-    yp_change_t *yp_change = calloc (1, sizeof (*yp_change));
-    char *artist, *title, *song = NULL;
-
-    artist = stats_retrieve (stats, "artist");
-    title = stats_retrieve (stats, "title");
-    if (artist || title)
-    {
-        char *separator = " - ";
-        if (artist == NULL)
-        {
-            artist = strdup("");
-            separator = "";
-        }
-        if (title == NULL) title = strdup("");
-        song = malloc (strlen (artist) + strlen (title) + strlen (separator) +1);
-        if (song)
-        {
-            sprintf (song, "%s%s%s", artist, separator, title);
-            stats_set_flags (stats, "yp_currently_playing", song, STATS_COUNTERS);
-        }
-    }
-    free (artist);
-    free (title);
-    yp_change->mount = strdup (mount);
-    yp_change->callback = yp_touch_callback;
-    yp_change->extra = song;
-    yp_queue_change (yp_change);
-}
-
-
-/* Add YP entries to active servers */
-void yp_add (const char *mount)
-{
-    yp_change_t *yp_change = calloc (1, sizeof (*yp_change));
-    yp_change->mount = strdup (mount);
-    yp_change->callback = yp_add_callback;
-    yp_queue_change (yp_change);
-}
-
-
-/* Mark any existing entry in the YP list to be marked for deletion */
-void yp_remove (const char *mount)
-{
-    yp_change_t *yp_change = calloc (1, sizeof (*yp_change));
-    yp_change->mount = strdup (mount);
-    yp_change->callback = yp_remove_callback;
-    yp_queue_change (yp_change);
+    thread_rwlock_unlock (&yp_lock);
 }
 
 
 void yp_shutdown (void)
 {
-    DEBUG0 ("releasing directory details");
-    if (yp_initialised == 0)
-        return;
-    thread_rwlock_destroy (&yp_lock);
-    thread_mutex_destroy (&yp_pending_lock);
+    thread_rwlock_wlock(&yp_lock);
+    yp_running = 0;
+    yp_update = 1;
+    thread_rwlock_unlock(&yp_lock);
 
-    /* free server and ypdata left */
-    while (active_yps)
-    {
-        struct yp_server *server = (struct yp_server *)active_yps;
-        active_yps = server->next;
-        destroy_yp_server (server);
-    }
+    if (yp_thread)
+        thread_join (yp_thread);
     free ((char*)server_version);
     server_version = NULL;
-    active_yps = NULL;
-    yp_initialised = 0;
-    INFO0 ("YP cleanup complete");
-}
-
-
-void yp_stop (void)
-{
-    worker_t *w = ypclient.worker;
-    if (w)
-    {
-        ypclient.connection.error = 1;
-        ypclient.schedule_ms = 0;
-        worker_wakeup(w);
-        DEBUG0 ("YP client is now stopped");
-        thread_mutex_lock (&yp_pending_lock);
-        if (yp_pending_thread)
-        {
-            thread_mutex_unlock (&yp_pending_lock);
-            thread_sleep (60000);
-        }
-        else
-            thread_mutex_unlock (&yp_pending_lock);
-    }
+    ICECAST_LOG_INFO("YP thread down");
 }
 

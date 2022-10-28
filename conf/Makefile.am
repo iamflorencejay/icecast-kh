@@ -1,8 +1,6 @@
 ## Process this with automake to create Makefile.in
 
-AUTOMAKE_OPTIONS = foreign
-
-EXTRA_DIST = icecast.xml.in icecast_minimal.xml.in icecast_shoutcast_compat.xml.in icecast_auth.php
+EXTRA_DIST = icecast.xml.in icecast_minimal.xml.in icecast_shoutcast_compat.xml.in
 DISTCLEANFILES = icecast.xml.dist icecast_minimal.xml.dist icecast_shoutcast_compat.xml.dist
 
 docdir = $(datadir)/$(PACKAGE)/doc
@@ -12,9 +10,6 @@ install-data-hook:
 	$(mkinstalldirs) $(DESTDIR)$(sysconfdir)
 	test -f $(DESTDIR)$(sysconfdir)/icecast.xml || \
 	$(INSTALL_DATA) icecast.xml.dist $(DESTDIR)$(sysconfdir)/icecast.xml
-
-uninstall-hook:
-	-rm -f $(DESTDIR)$(sysconfdir)/icecast.xml
 
 edit = sed -e 's,@pkgdatadir\@,$(pkgdatadir),g' \
 	-e 's,@localstatedir\@,$(localstatedir),g' \

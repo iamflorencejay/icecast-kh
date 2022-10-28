@@ -8,37 +8,80 @@
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
+ * Copyright 2014-2018, Philipp "ph3-der-loewe" Schafft <lion@lion.leolix.org>,
  */
 
 #ifndef __STATS_H__
 #define __STATS_H__
 
-#include "cfgfile.h"
-#include "connection.h"
-#include "httpp/httpp.h"
-#include "client.h"
 #include <libxml/xmlmemory.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 
-#define STATS_HIDDEN   1
-#define STATS_SLAVE    2
-#define STATS_GENERAL  4
-#define STATS_COUNTERS 8
-#define STATS_PUBLIC   (STATS_GENERAL|STATS_COUNTERS)
-#define STATS_REGULAR   01000
-#define STATS_ALL      ~0
+#include "icecasttypes.h"
+#include "refbuf.h"
 
-typedef uintptr_t stats_handle_t;
+#define STATS_XML_FLAG_NONE             0x0000U
+#define STATS_XML_FLAG_SHOW_HIDDEN      0x0001U
+#define STATS_XML_FLAG_SHOW_LISTENERS   0x0002U
+#define STATS_XML_FLAG_PUBLIC_VIEW      0x0004U
+
+typedef struct _stats_node_tag
+{
+    char *name;
+    char *value;
+    int hidden;
+} stats_node_t;
+
+typedef struct _stats_event_tag
+{
+    char *source;
+    char *name;
+    char *value;
+    int  hidden;
+    int  action;
+
+    struct _stats_event_tag *next;
+} stats_event_t;
+
+typedef struct _stats_source_tag
+{
+    char *source;
+    int  hidden;
+    avl_tree *stats_tree;
+} stats_source_t;
+
+typedef struct _stats_tag
+{
+    avl_tree *global_tree;
+
+    /* global stats
+    start_time
+    total_users
+    max_users
+    total_sources
+    max_sources
+    total_user_connections
+    total_source_connections
+    */
+
+    avl_tree *source_tree;
+
+    /* stats by source, and for stats
+    start_time
+    total_users
+    max_users
+    */
+
+} stats_t;
 
 void stats_initialize(void);
 void stats_shutdown(void);
 
 void stats_global(ice_config_t *config);
-void stats_get_streamlist (char *buffer, size_t remaining);
-refbuf_t *stats_get_streams (int prepend);
-void stats_purge (time_t mark);
-void stats_clients_wakeup (void);
+stats_t *stats_get_stats(void);
+refbuf_t *stats_get_streams (void);
+void stats_clear_virtual_mounts (void);
 
 void stats_event(const char *source, const char *name, const char *value);
 void stats_event_conv(const char *mount, const char *name,
@@ -48,32 +91,19 @@ void stats_event_inc(const char *source, const char *name);
 void stats_event_add(const char *source, const char *name, unsigned long value);
 void stats_event_sub(const char *source, const char *name, unsigned long value);
 void stats_event_dec(const char *source, const char *name);
-void stats_event_flags (const char *source, const char *name, const char *value, int flags);
-void stats_event_time (const char *mount, const char *name, int flags);
+void stats_event_hidden (const char *source, const char *name, int hidden);
+void stats_event_time (const char *mount, const char *name);
+void stats_event_time_iso8601 (const char *mount, const char *name);
 
 void *stats_connection(void *arg);
-void stats_add_listener (client_t *client, int hidden_level);
-void stats_global_calc (time_t now);
+void stats_callback (client_t *client, void *notused);
 
-int  stats_transform_xslt(client_t *client, const char *uri);
+void stats_transform_xslt(client_t *client);
 void stats_sendxml(client_t *client);
-xmlDocPtr stats_get_xml(int flags, const char *show_mount);
+xmlDocPtr stats_get_xml(unsigned int flags, const char *show_mount, client_t *client);
 char *stats_get_value(const char *source, const char *name);
 
-stats_handle_t stats_handle (const char *mount);
-stats_handle_t stats_lock (stats_handle_t handle, const char *mount);
-void stats_release (stats_handle_t handle);
-void stats_flush (stats_handle_t handle);
-void stats_set (stats_handle_t handle, const char *name, const char *value);
-void stats_set_expire (stats_handle_t stats, time_t mark);
-void stats_set_inc (stats_handle_t handle, const char *name);
-void stats_set_args (stats_handle_t handle, const char *name, const char *format, ...);
-void stats_set_flags (stats_handle_t handle, const char *name, const char *value, int flags);
-void stats_set_conv (stats_handle_t handle, const char *name, const char *value, const char *charset);
-void stats_set_time (stats_handle_t handle, const char *name, int flags, time_t tm);
-char *stats_retrieve (stats_handle_t handle, const char *name);
-
-void stats_listener_to_xml (client_t *listener, xmlNodePtr parent);
+void stats_add_authstack(auth_stack_t *stack, xmlNodePtr parent);
 
 #endif  /* __STATS_H__ */
 

@@ -3,11 +3,12 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
+ * Copyright 2014-2018, Philipp "ph3-der-loewe" Schafft <lion@lion.leolix.org>,
  */
 
 
@@ -21,14 +22,11 @@
 #include <string.h>
 #include <ogg/ogg.h>
 
-typedef struct source_tag source_t;
-
 #include "refbuf.h"
 #include "format_ogg.h"
 #include "format_skeleton.h"
 #include "client.h"
 #include "stats.h"
-#include "global.h"
 
 #define CATMODULE "format-skeleton"
 #include "logging.h"
@@ -36,7 +34,7 @@ typedef struct source_tag source_t;
 
 static void skeleton_codec_free (ogg_state_t *ogg_info, ogg_codec_t *codec)
 {
-    DEBUG0 ("freeing skeleton codec");
+    ICECAST_LOG_DEBUG("freeing skeleton codec");
     ogg_stream_clear (&codec->os);
     free (codec);
 }
@@ -45,7 +43,7 @@ static void skeleton_codec_free (ogg_state_t *ogg_info, ogg_codec_t *codec)
 /* skeleton pages are not rebuilt, so here we just for headers and then
  * pass them straight through to the the queue
  */
-static refbuf_t *process_skeleton_page (ogg_state_t *ogg_info, ogg_codec_t *codec, ogg_page *page)
+static refbuf_t *process_skeleton_page (ogg_state_t *ogg_info, ogg_codec_t *codec, ogg_page *page, format_plugin_t *plugin)
 {
     ogg_packet packet;
 
@@ -61,7 +59,7 @@ static refbuf_t *process_skeleton_page (ogg_state_t *ogg_info, ogg_codec_t *code
     }
 
     /* all skeleon packets are headers */
-    format_ogg_attach_header (codec, page);
+    format_ogg_attach_header (ogg_info, page);
     return NULL;
 }
 
@@ -80,7 +78,7 @@ ogg_codec_t *initial_skeleton_page (format_plugin_t *plugin, ogg_page *page)
 
     ogg_stream_packetout (&codec->os, &packet);
 
-    DEBUG0("checking for skeleton codec");
+    ICECAST_LOG_DEBUG("checking for skeleton codec");
 
     if ((packet.bytes<8) || memcmp(packet.packet, "fishead\0", 8))
     {
@@ -89,14 +87,13 @@ ogg_codec_t *initial_skeleton_page (format_plugin_t *plugin, ogg_page *page)
         return NULL;
     }
 
-    INFO0 ("seen initial skeleton header");
+    ICECAST_LOG_INFO("seen initial skeleton header");
     codec->process_page = process_skeleton_page;
     codec->codec_free = skeleton_codec_free;
-    codec->parent = ogg_info;
     codec->headers = 1;
     codec->name = "Skeleton";
 
-    format_ogg_attach_header (codec, page);
+    format_ogg_attach_header(ogg_info, page);
     return codec;
 }
 

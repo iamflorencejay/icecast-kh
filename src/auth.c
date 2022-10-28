@@ -3,14 +3,15 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
+ * Copyright 2013-2018, Philipp "ph3-der-loewe" Schafft <lion@lion.leolix.org>,
  */
 
-/** 
+/**
  * Client authentication functions
  */
 
@@ -22,163 +23,157 @@
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
-#ifdef HAVE_MALLOC_H
-#include <malloc.h>
-#endif
 
 #include "auth.h"
-#include "auth_htpasswd.h"
-#include "auth_cmd.h"
-#include "auth_url.h"
 #include "source.h"
 #include "client.h"
+#include "errors.h"
 #include "cfgfile.h"
 #include "stats.h"
-#include "httpp/httpp.h"
+#include "common/httpp/httpp.h"
 #include "fserve.h"
 #include "admin.h"
-#include "global.h"
+#include "acl.h"
 
 #include "logging.h"
 #define CATMODULE "auth"
 
-struct _auth_thread_t
-{
-    thread_type *thread;
-    void *data;
-    unsigned int id;
-    struct auth_tag *auth;
+/* data structures */
+struct auth_stack_tag {
+    size_t refcount;
+    auth_t *auth;
+    mutex_t lock;
+    auth_stack_t *next;
 };
 
-static volatile int thread_id;
-static rwlock_t auth_lock;
-int allow_auth;
+/* code */
+static void __handle_auth_client(auth_t *auth, auth_client *auth_user);
 
-static void *auth_run_thread (void *arg);
-static int  auth_postprocess_listener (auth_client *auth_user);
-static void auth_postprocess_source (auth_client *auth_user);
-static int  wait_for_auth (client_t *client);
-static void auth_client_free (auth_client *auth_user);
+static mutex_t _auth_lock; /* protects _current_id */
+static volatile unsigned long _current_id = 0;
 
+static unsigned long _next_auth_id(void) {
+    unsigned long id;
 
-struct _client_functions auth_release_ops =
-{
-    wait_for_auth,
-    client_destroy
-};
+    thread_mutex_lock(&_auth_lock);
+    id = _current_id++;
+    thread_mutex_unlock(&_auth_lock);
 
-
-static int wait_for_auth (client_t *client)
-{
-    DEBUG0 ("client finished with auth");
-    client->flags &= ~CLIENT_AUTHENTICATED;
-    return -1;
+    return id;
 }
 
+static const struct {
+    auth_result result;
+    const char *string;
+} __auth_results[] = {
+    {.result = AUTH_UNDEFINED,      .string = "undefined"},
+    {.result = AUTH_OK,             .string = "ok"},
+    {.result = AUTH_FAILED,         .string = "failed"},
+    {.result = AUTH_RELEASED,       .string = "released"},
+    {.result = AUTH_FORBIDDEN,      .string = "forbidden"},
+    {.result = AUTH_NOMATCH,        .string = "no match"},
+    {.result = AUTH_USERADDED,      .string = "user added"},
+    {.result = AUTH_USEREXISTS,     .string = "user exists"},
+    {.result = AUTH_USERDELETED,    .string = "user deleted"}
+};
 
-void auth_check_http (client_t *client)
+static const char *auth_result2str(auth_result res)
 {
-    const char *header;
-    char *username, *password;
+    size_t i;
 
-    /* process any auth headers if any available */
-    header = httpp_getvar (client->parser, "authorization");
-    if (header == NULL)
-        return;
-
-    if (strncmp(header, "Basic ", 6) == 0)
-    {
-        /* This will look something like "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==" */
-        char *tmp, *userpass = util_base64_decode (header+6);
-        if (userpass == NULL)
-        {
-            WARN1("Base64 decode of Authorization header \"%s\" failed",
-                    header+6);
-            return;
-        }
-
-        tmp = strchr(userpass, ':');
-        if (tmp == NULL)
-        {
-            free (userpass);
-            return;
-        }
-
-        *tmp = 0;
-        username = userpass;
-        password = tmp+1;
-        client->username = strdup (username);
-        client->password = strdup (password);
-        free (userpass);
-        return;
+    for (i = 0; i < (sizeof(__auth_results)/sizeof(*__auth_results)); i++) {
+        if (__auth_results[i].result == res)
+            return __auth_results[i].string;
     }
-    WARN1 ("unhandled authorization header: %s", header);
+
+    return "(unknown)";
 }
 
-
-static auth_client *auth_client_setup (const char *mount, client_t *client)
+auth_result auth_str2result(const char *str)
 {
-    ice_config_t *config = config_get_config_unlocked();
-    auth_client *auth_user = calloc (1, sizeof(auth_client));
+    size_t i;
 
-    auth_user->mount = strdup (mount);
-    auth_user->hostname = strdup (config->hostname);
-    auth_user->port = config->port;
+    for (i = 0; i < (sizeof(__auth_results)/sizeof(*__auth_results)); i++) {
+        if (strcasecmp(__auth_results[i].string, str) == 0)
+            return __auth_results[i].result;
+    }
+
+    return AUTH_FAILED;
+}
+
+static auth_client *auth_client_setup (client_t *client)
+{
+    /* This will look something like "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==" */
+    auth_client *auth_user;
+
+    do {
+        const char *header;
+        char *userpass, *tmp;
+        char *username, *password;
+
+        /* check if we already have auth infos */
+        if (client->username || client->password)
+            break;
+
+        header = httpp_getvar(client->parser, "authorization");
+
+        if (header == NULL)
+            break;
+
+        if (strncmp(header, "Basic ", 6) == 0) {
+            userpass = util_base64_decode (header+6);
+            if (userpass == NULL) {
+                ICECAST_LOG_WARN("Base64 decode of Authorization header \"%s\" failed",
+                        header+6);
+                break;
+            }
+
+            tmp = strchr(userpass, ':');
+            if (tmp == NULL) {
+                free(userpass);
+                break;
+            }
+
+            *tmp = 0;
+            username = userpass;
+            password = tmp+1;
+            client->username = strdup(username);
+            client->password = strdup(password);
+            free (userpass);
+            break;
+        }
+        ICECAST_LOG_INFO("unhandled authorization header: %s", header);
+    } while (0);
+
+    auth_user = calloc(1, sizeof(auth_client));
     auth_user->client = client;
-    if (client)
-        client->mount = auth_user->mount;
     return auth_user;
 }
 
 
-static void queue_auth_client (auth_client *auth_user, mount_proxy *mountinfo)
+static void queue_auth_client (auth_client *auth_user)
 {
     auth_t *auth;
-    client_t *failed = NULL;
-    auth_client **old_tail;
 
-    if (auth_user == NULL || mountinfo == NULL)
+    if (auth_user == NULL)
         return;
-    auth = mountinfo->auth;
-    thread_mutex_lock (&auth->lock);
     auth_user->next = NULL;
-    auth_user->auth = auth;
-    old_tail = auth->tailp;
-    *auth->tailp = auth_user;
-    auth->tailp = &auth_user->next;
-    auth->pending_count++;
-    if (auth->refcount > auth->handlers)
-        DEBUG0 ("max authentication handlers allocated");
-    else
+    if (auth_user->client == NULL || auth_user->client->auth == NULL)
     {
-        int i;
-        for (i=0; i<auth->handlers; i++)
-        {
-            if (auth->handles [i].thread == NULL)
-            {
-                DEBUG1 ("starting auth thread %d", i);
-                auth->refcount++;
-                auth->handles [i].thread = thread_create ("auth thread", auth_run_thread, &auth->handles [i], THREAD_DETACHED);
-                if (auth->handles [i].thread == NULL)
-                {
-                    auth->tailp = old_tail;
-                    *old_tail = NULL;
-                    auth->pending_count--;
-                    auth->refcount--;
-                    failed = auth_user->client;
-                    auth_user->client = NULL;
-                    ERROR0 ("failed to start auth thread, system limit probably reached");
-                }
-                break;
-            }
-        }
+        ICECAST_LOG_WARN("internal state is incorrect for %p", auth_user->client);
+        return;
     }
-    DEBUG2 ("auth on %s has %d pending", auth->mount, auth->pending_count);
-    thread_mutex_unlock (&auth->lock);
-    if (failed)
-    {
-        client_send_403redirect (failed, auth_user->mount, "system limit reached");
-        auth_client_free (auth_user);
+    auth = auth_user->client->auth;
+    ICECAST_LOG_DDEBUG("...refcount on auth_t %s is now %d", auth->mount, (int)auth->refcount);
+    if (auth->immediate) {
+        __handle_auth_client(auth, auth_user);
+    } else {
+        thread_mutex_lock (&auth->lock);
+        *auth->tailp = auth_user;
+        auth->tailp = &auth_user->next;
+        auth->pending_count++;
+        ICECAST_LOG_INFO("auth on %s has %d pending", auth->mount, auth->pending_count);
+        thread_mutex_unlock (&auth->lock);
     }
 }
 
@@ -186,551 +181,382 @@ static void queue_auth_client (auth_client *auth_user, mount_proxy *mountinfo)
 /* release the auth. It is referred to by multiple structures so this is
  * refcounted and only actual freed after the last use
  */
-void auth_release (auth_t *authenticator)
-{
-    if (authenticator == NULL) return;
+void auth_release (auth_t *authenticator) {
+    size_t i;
+
+    if (authenticator == NULL)
+        return;
+
+    thread_mutex_lock(&authenticator->lock);
     authenticator->refcount--;
-    DEBUG2 ("...refcount on auth_t %s is now %d", authenticator->mount, authenticator->refcount);
+    ICECAST_LOG_DDEBUG("...refcount on auth_t %s is now %d", authenticator->mount, (int)authenticator->refcount);
     if (authenticator->refcount)
     {
-        thread_mutex_unlock (&authenticator->lock);
+        thread_mutex_unlock(&authenticator->lock);
         return;
     }
 
-    /* cleanup auth threads attached to this auth */
-    authenticator->flags &= ~AUTH_RUNNING;
-    while (authenticator->handlers)
-    {
-        if (authenticator->release_thread_data)
-            authenticator->release_thread_data (authenticator,
-                    authenticator->handles [authenticator->handlers-1].data);
-        authenticator->handlers--;
+    /* cleanup auth thread attached to this auth */
+    if (authenticator->running) {
+        authenticator->running = 0;
+        thread_mutex_unlock(&authenticator->lock);
+        thread_join(authenticator->thread);
+        thread_mutex_lock(&authenticator->lock);
     }
-    free (authenticator->handles);
 
-    if (authenticator->release)
-        authenticator->release (authenticator);
-    xmlFree (authenticator->type);
-    xmlFree (authenticator->realm);
-    xmlFree (authenticator->rejected_mount);
-    thread_mutex_unlock (&authenticator->lock);
-    thread_mutex_destroy (&authenticator->lock);
-    free (authenticator->mount);
-    free (authenticator);
+    if (authenticator->free)
+        authenticator->free(authenticator);
+    if (authenticator->type)
+        xmlFree (authenticator->type);
+    if (authenticator->role)
+        xmlFree (authenticator->role);
+    if (authenticator->management_url)
+        xmlFree (authenticator->management_url);
+    if (authenticator->failed_arg)
+        xmlFree (authenticator->failed_arg);
+    if (authenticator->deny_arg)
+        xmlFree (authenticator->deny_arg);
+    thread_mutex_unlock(&authenticator->lock);
+    thread_mutex_destroy(&authenticator->lock);
+    if (authenticator->mount)
+        free(authenticator->mount);
+    acl_release(authenticator->acl);
+    config_clear_http_header(authenticator->http_headers);
+
+    for (i = 0; i < authenticator->filter_origin_len; i++) {
+        free(authenticator->filter_origin[i].origin);
+    }
+    free(authenticator->filter_origin);
+
+    free(authenticator);
 }
 
+/* increment refcount on the auth.
+ */
+void    auth_addref (auth_t *authenticator) {
+    if (authenticator == NULL)
+        return;
+
+    thread_mutex_lock (&authenticator->lock);
+    authenticator->refcount++;
+    ICECAST_LOG_DDEBUG("...refcount on auth_t %s is now %d", authenticator->mount, (int)authenticator->refcount);
+    thread_mutex_unlock (&authenticator->lock);
+}
 
 static void auth_client_free (auth_client *auth_user)
 {
-    if (auth_user == NULL)
+    if (!auth_user)
         return;
-    if (auth_user->client)
-    {
-        client_t *client = auth_user->client;
 
-        client_send_401 (client, auth_user->auth->realm);
-        auth_user->client = NULL;
-    }
-    free (auth_user->hostname);
-    free (auth_user->mount);
-    free (auth_user);
+    free(auth_user->alter_client_arg);
+    free(auth_user);
 }
 
 
-/* wrapper function for auth thread to authenticate new listener
- * connection details
- */
-static void auth_new_listener (auth_client *auth_user)
-{
+/* verify that the client is still connected. */
+static int is_client_connected (client_t *client) {
+/* As long as sock_active() is broken we need to disable this:
+
+    int ret = 1;
+    if (client)
+        if (sock_active(client->con->sock) == 0)
+            ret = 0;
+    return ret;
+*/
+    return 1;
+}
+
+static auth_result auth_new_client (auth_t *auth, auth_client *auth_user) {
     client_t *client = auth_user->client;
+    auth_result ret = AUTH_FAILED;
 
     /* make sure there is still a client at this point, a slow backend request
      * can be avoided if client has disconnected */
-    if (allow_auth == 0 || client_connected (client) == 0)
-    {
-        DEBUG1 ("dropping listener #%" PRIu64 " connection", client->connection.id);
+    if (is_client_connected(client) == 0) {
+        ICECAST_LOG_DEBUG("client is no longer connected");
         client->respcode = 400;
-        return;
+        auth_release (client->auth);
+        client->auth = NULL;
+        return AUTH_FAILED;
     }
-    if (auth_user->auth->authenticate)
-    {
-        switch (auth_user->auth->authenticate (auth_user))
+
+    if (auth->authenticate_client) {
+        ret = auth->authenticate_client(auth_user);
+        if (ret != AUTH_OK)
         {
-            case AUTH_OK:
-            case AUTH_FAILED:
-                break;
-            default:
-                return;
+            auth_release (client->auth);
+            client->auth = NULL;
+            return ret;
         }
     }
-    auth_postprocess_listener (auth_user);
+    return ret;
 }
 
 
-/* wrapper function for auth thread to drop listener connections
+/* wrapper function for auth thread to drop client connections
  */
-static void auth_remove_listener (auth_client *auth_user)
-{
-    if (auth_user->auth->release_listener)
-        auth_user->auth->release_listener (auth_user);
-    auth_user->auth = NULL;
-
-    /* client is going, so auth is not an issue at this point */
-    if (auth_user->client)
-    {
-        client_t *client = auth_user->client;
-        client->flags &= ~CLIENT_AUTHENTICATED;
-        DEBUG1 ("client #%" PRIu64 " completed", client->connection.id);
-        if (client->worker)
-            client_send_404 (client, NULL);
-        else
-            client_destroy (auth_user->client);
-        auth_user->client = NULL;
-    }
-}
-
-
-/* Called from auth thread to process any request for source client
- * authentication. Only applies to source clients, not relays.
- */
-static void stream_auth_callback (auth_client *auth_user)
+static auth_result auth_remove_client(auth_t *auth, auth_client *auth_user)
 {
     client_t *client = auth_user->client;
+    auth_result ret = AUTH_RELEASED;
 
-    if (auth_user->auth->stream_auth)
-        auth_user->auth->stream_auth (auth_user);
+    (void)auth;
 
-    if (client->flags & CLIENT_AUTHENTICATED)
-        auth_postprocess_source (auth_user);
-    else
-        WARN1 ("Failed auth for source \"%s\"", auth_user->mount);
+    if (client->auth->release_client)
+        ret = client->auth->release_client(auth_user);
+
+    auth_release(client->auth);
+    client->auth = NULL;
+
+    /* client is going, so auth is not an issue at this point */
+    acl_release(client->acl);
+    client->acl = NULL;
+
+    return ret;
 }
 
-
-/* Callback from auth thread to handle a stream start event, this applies
- * to both source clients and relays.
- */
-static void stream_start_callback (auth_client *auth_user)
+static inline int __handle_auth_client_alter(client_t *client, auth_alter_t action, const char *arg)
 {
-    auth_t *auth = auth_user->auth;
+    const char *uuid = NULL;
+    const char *location = NULL;
+    int http_status = 0;
 
-    if (auth->stream_start)
-        auth->stream_start (auth_user);
-    if (auth_user->client)
-    {
-        client_t *client = auth_user->client;
-        free (client->connection.ip);
-        free (client->shared_data); // useragent
-        free (client);
-        auth_user->client = NULL;
+    switch (action) {
+        case AUTH_ALTER_NOOP:
+            return 0;
+        break;
+        case AUTH_ALTER_REWRITE:
+            util_replace_string(&(client->uri), arg);
+            return 0;
+        break;
+        case AUTH_ALTER_REDIRECT:
+        /* fall through */
+        case AUTH_ALTER_REDIRECT_SEE_OTHER:
+            uuid = "be7fac90-54fb-4673-9e0d-d15d6a4963a2";
+            http_status = 303;
+            location = arg;
+        break;
+        case AUTH_ALTER_REDIRECT_TEMPORARY:
+            uuid = "4b08a03a-ecce-4981-badf-26b0bb6c9d9c";
+            http_status = 307;
+            location = arg;
+        break;
+        case AUTH_ALTER_REDIRECT_PERMANENT:
+            uuid = "36bf6815-95cb-4cc8-a7b0-6b4b0c82ac5d";
+            http_status = 308;
+            location = arg;
+        break;
+        case AUTH_ALTER_SEND_ERROR:
+            client_send_error_by_uuid(client, arg);
+            return 1;
+        break;
     }
+
+    if (uuid && location && http_status) {
+        client_send_redirect(client, uuid, http_status, location);
+        return 1;
+    }
+
+    return -1;
 }
 
+static void __handle_auth_client (auth_t *auth, auth_client *auth_user) {
+    auth_result result;
 
-/* Callback from auth thread to handle a stream start event, this applies
- * to both source clients and relays.
- */
-static void stream_end_callback (auth_client *auth_user)
-{
-    auth_t *auth = auth_user->auth;
-
-    if (auth->stream_end)
-        auth->stream_end (auth_user);
-    if (auth_user->client)
-    {
-        client_t *client = auth_user->client;
-        free (client->connection.ip);
-        free (client->shared_data); // useragent
-        free (client);
-        auth_user->client = NULL;
+    if (auth_user->process) {
+        result = auth_user->process(auth, auth_user);
+    } else {
+        ICECAST_LOG_ERROR("client auth process not set");
+        result = AUTH_FAILED;
     }
-}
 
+    ICECAST_LOG_DEBUG("client %p on auth %p role %s processed: %s", auth_user->client, auth, auth->role, auth_result2str(result));
+
+    if (result == AUTH_OK) {
+        if (auth_user->client->acl)
+            acl_release(auth_user->client->acl);
+        acl_addref(auth_user->client->acl = auth->acl);
+        if (auth->role && !auth_user->client->role) /* TODO: Handle errors here */
+            auth_user->client->role = strdup(auth->role);
+    }
+
+    if (result != AUTH_NOMATCH) {
+        if (__handle_auth_client_alter(auth_user->client, auth_user->alter_client_action, auth_user->alter_client_arg) == 1)
+            return;
+    }
+
+    if (result == AUTH_NOMATCH && auth_user->on_no_match) {
+        auth_user->on_no_match(auth_user->client, auth_user->on_result, auth_user->userdata);
+    } else if (auth_user->on_result) {
+        auth_user->on_result(auth_user->client, auth_user->userdata, result);
+    }
+
+    auth_client_free (auth_user);
+}
 
 /* The auth thread main loop. */
 static void *auth_run_thread (void *arg)
 {
-    auth_thread_t *handler = arg;
-    auth_t *auth = handler->auth;
+    auth_t *auth = arg;
 
-    DEBUG2 ("Authentication thread %d started for %s", handler->id, auth->mount);
-    thread_rwlock_rlock (&auth_lock);
+    ICECAST_LOG_INFO("Authentication thread started");
+    while (1) {
+        thread_mutex_lock(&auth->lock);
 
-    while (1)
-    {
-        thread_mutex_lock (&auth->lock);
-        if (auth->head)
-        {
-            auth_client *auth_user = auth->head;
+        if (!auth->running) {
+            thread_mutex_unlock(&auth->lock);
+            break;
+        }
 
-            DEBUG2 ("%d client(s) pending on %s", auth->pending_count, auth->mount);
+        if (auth->head) {
+            auth_client *auth_user;
+
+            /* may become NULL before lock taken */
+            auth_user = (auth_client*)auth->head;
+            if (auth_user == NULL)
+            {
+                thread_mutex_unlock (&auth->lock);
+                continue;
+            }
+            ICECAST_LOG_DDEBUG("%d client(s) pending on %s (role %s)", auth->pending_count, auth->mount, auth->role);
             auth->head = auth_user->next;
             if (auth->head == NULL)
                 auth->tailp = &auth->head;
             auth->pending_count--;
-            thread_mutex_unlock (&auth->lock);
+            thread_mutex_unlock(&auth->lock);
             auth_user->next = NULL;
 
-            /* associate per-thread data with auth_user here */
-            auth_user->thread_data = handler->data;
-            auth_user->handler = handler->id;
-
-            if (auth_user->process)
-                auth_user->process (auth_user);
-
-            auth_client_free (auth_user);
+            __handle_auth_client(auth, auth_user);
 
             continue;
+        } else {
+            thread_mutex_unlock(&auth->lock);
         }
-        handler->thread = NULL;
-        break;
+        thread_sleep (150000);
     }
-    DEBUG1 ("Authenication thread %d shutting down", handler->id);
-    auth_release (auth);
-    thread_rwlock_unlock (&auth_lock);
+    ICECAST_LOG_INFO("Authentication thread shutting down");
     return NULL;
 }
 
 
-int move_listener (client_t *client, struct _fbinfo *finfo)
-{
-    source_t *source;
-    mount_proxy *minfo;
-    int rate = finfo->limit, loop = 20, ret = -1;
-    ice_config_t *config = config_get_config();
-    struct _fbinfo where;
-    unsigned int len = 4096;
-    char buffer [len];
-
-    memcpy (&where, finfo, sizeof (where));
-    if (finfo->fallback)
-        where.fallback = strdup (finfo->fallback);
-    avl_tree_rlock (global.source_tree);
-    do
-    {
-        len = sizeof buffer;
-        util_expand_pattern (where.fallback, where.mount, buffer, &len);
-        where.mount = buffer;
-
-        minfo = config_find_mount (config, where.mount);
-
-        if (rate == 0 && minfo && minfo->limit_rate)
-            rate = minfo->limit_rate;
-        source = source_find_mount_raw (where.mount);
-
-        if (source == NULL && minfo == NULL)
-            break;
-        if (source)
-        {
-            thread_rwlock_wlock (&source->lock);
-            if (source_available (source))
-            {
-                // an unused on-demand relay will still have an unitialised type
-                if (source->format->type == finfo->type || source->format->type == FORMAT_TYPE_UNDEFINED)
-                {
-                    config_release_config();
-                    avl_tree_unlock (global.source_tree);
-                    source_setup_listener (source, client);
-                    source->listeners++;
-                    client->flags |= CLIENT_HAS_MOVED;
-                    thread_rwlock_unlock (&source->lock);
-                    free (where.fallback);
-                    return 0;
-                }
-            }
-            thread_rwlock_unlock (&source->lock);
-        }
-        if (minfo && minfo->fallback_mount)
-        {
-            free (where.fallback);
-            where.fallback = strdup (where.mount);
-            where.mount = minfo->fallback_mount;
-        }
-        else
-            break;
-    } while (loop--);
-
-    avl_tree_unlock (global.source_tree);
-    config_release_config();
-    if (where.mount && ((client->flags & CLIENT_IS_SLAVE) == 0))
-    {
-        if (where.limit == 0)
-        {
-            if (rate == 0)
-                if (sscanf (where.mount, "%*[^[][%d]", &rate) == 1)
-                    rate = rate * 1000/8;
-            where.limit = rate;
-        }
-        client->intro_offset = 0;
-        ret = fserve_setup_client_fb (client, &where);
-    }
-    free (where.fallback);
-    return ret;
-}
-
-
-/* Add listener to the pending lists of either the source or fserve thread. This can be run
- * from the connection or auth thread context. return -1 to indicate that client has been
- * terminated, 0 for receiving content.
+/* Add a client.
  */
-static int add_authenticated_listener (const char *mount, mount_proxy *mountinfo, client_t *client)
-{
-    int ret = 0;
+static void auth_add_client(auth_t *auth, client_t *client, void (*on_no_match)(client_t *client, void (*on_result)(client_t *client, void *userdata, auth_result result), void *userdata), void (*on_result)(client_t *client, void *userdata, auth_result result), void *userdata) {
+    auth_client *auth_user;
+    auth_matchtype_t matchtype;
+    const char *origin;
+    size_t i;
 
-    if (client->parser->req_type != httpp_req_head)
-        client->flags |= CLIENT_AUTHENTICATED;
+    ICECAST_LOG_DDEBUG("Trying to add client %p to auth %p's (role %s) queue.", client, auth, auth->role);
 
-    /* some win32 setups do not do TCP win scaling well, so allow an override */
-    if (mountinfo && mountinfo->so_sndbuf > 0)
-        sock_set_send_buffer (client->connection.sock, mountinfo->so_sndbuf);
-
-    /* check whether we are processing a streamlist request for slaves */
-    if (strcmp (mount, "/admin/streams") == 0)
-    {
-        client->flags |= CLIENT_IS_SLAVE;
-        if (client->parser->req_type == httpp_req_stats)
-        {
-            stats_add_listener (client, STATS_SLAVE|STATS_GENERAL);
-            return 0;
-        }
-        mount = httpp_get_query_param (client->parser, "mount");
-        if (mount == NULL)
-        {
-            command_list_mounts (client, TEXT);
-            return 0;
-        }
-        mountinfo = config_find_mount (config_get_config_unlocked(), mount);
+    /* TODO: replace that magic number */
+    if (auth->pending_count > 100) {
+        ICECAST_LOG_WARN("too many clients awaiting authentication on auth %p", auth);
+        client_send_error_by_id(client, ICECAST_ERROR_AUTH_BUSY);
+        return;
     }
 
-    /* Here we are parsing the URI request to see if the extension is .xsl, if
-     * so, then process this request as an XSLT request
+    if (auth->filter_method[client->parser->req_type] == AUTH_MATCHTYPE_NOMATCH) {
+        if (on_no_match) {
+           on_no_match(client, on_result, userdata);
+        } else if (on_result) {
+           on_result(client, userdata, AUTH_NOMATCH);
+        }
+        return;
+    }
+
+    /* Filter for CORS "Origin".
+     *
+     * CORS actually knows about non-CORS requests and assigned the "null"
+     * location to them.
      */
-    if (util_check_valid_extension (mount) == XSLT_CONTENT)
-    {
-        /* If the file exists, then transform it, otherwise, write a 404 */
-        DEBUG0("Stats request, sending XSL transformed stats");
-        return stats_transform_xslt (client, mount);
-    }
+    origin = httpp_getvar(client->parser, "origin");
+    if (!origin)
+        origin = "null";
 
-    ret = source_add_listener (mount, mountinfo, client);
-
-    if (ret == -2)
-    {
-        if (mountinfo && mountinfo->file_seekable == 0)
-        {
-            DEBUG1 ("disable seek on file matching %s", mountinfo->mountname);
-            httpp_deletevar (client->parser, "range");
-            client->flags |= CLIENT_NO_CONTENT_LENGTH;
+    matchtype = auth->filter_origin_policy;
+    for (i = 0; i < auth->filter_origin_len; i++) {
+        if (strcmp(auth->filter_origin[i].origin, origin) == 0) {
+            matchtype = auth->filter_origin[i].type;
+            break;
         }
-        client->mount = mount;
-        ret = fserve_client_create (client, mount);
     }
-    return ret;
+    if (matchtype == AUTH_MATCHTYPE_NOMATCH) {
+        if (on_no_match) {
+            on_no_match(client, on_result, userdata);
+        } else if (on_result) {
+            on_result(client, userdata, AUTH_NOMATCH);
+        }
+        return;
+    }
+
+    if (client->admin_command == ADMIN_COMMAND_ERROR) {
+        /* this is a web/ client */
+        matchtype = auth->filter_web_policy;
+    } else {
+        /* this is a admin/ client */
+        size_t i;
+
+        matchtype = AUTH_MATCHTYPE_UNUSED;
+
+        for (i = 0; i < (sizeof(auth->filter_admin)/sizeof(*(auth->filter_admin))); i++) {
+            if (auth->filter_admin[i].type != AUTH_MATCHTYPE_UNUSED && auth->filter_admin[i].command == client->admin_command) {
+                matchtype = auth->filter_admin[i].type;
+                break;
+            }
+        }
+
+        if (matchtype == AUTH_MATCHTYPE_UNUSED)
+            matchtype = auth->filter_admin_policy;
+    }
+    if (matchtype == AUTH_MATCHTYPE_NOMATCH) {
+        if (on_no_match) {
+           on_no_match(client, on_result, userdata);
+        } else if (on_result) {
+           on_result(client, userdata, AUTH_NOMATCH);
+        }
+        return;
+    }
+
+    auth_release(client->auth);
+    auth_addref(client->auth = auth);
+    auth_user = auth_client_setup(client);
+    auth_user->process = auth_new_client;
+    auth_user->on_no_match = on_no_match;
+    auth_user->on_result = on_result;
+    auth_user->userdata = userdata;
+    ICECAST_LOG_DDEBUG("adding client %p for authentication on %p", client, auth);
+    queue_auth_client(auth_user);
 }
 
-
-static int auth_postprocess_listener (auth_client *auth_user)
+static void __auth_on_result_destroy_client(client_t *client, void *userdata, auth_result result)
 {
-    int ret;
-    client_t *client = auth_user->client;
-    auth_t *auth = auth_user->auth;
-    ice_config_t *config;
-    mount_proxy *mountinfo;
-    const char *mount = auth_user->mount;
+    (void)userdata, (void)result;
 
-    if (client == NULL)
+    client_destroy(client);
+}
+
+/* determine whether we need to process this client further. This
+ * involves any auth exit, typically for external auth servers.
+ */
+int auth_release_client (client_t *client) {
+    if (!client->acl)
         return 0;
 
-    if ((client->flags & CLIENT_AUTHENTICATED) == 0)
-    {
-        /* auth failed so do we place the listener elsewhere */
-        auth_user->client = NULL;
-        if (auth->rejected_mount)
-            mount = auth->rejected_mount;
-        else
-        {
-            DEBUG1 ("listener #%" PRIu64 " rejected", client->connection.id);
-            client_send_401 (client, auth_user->auth->realm);
-            return -1;
-        }
-    }
-    config = config_get_config();
-    mountinfo = config_find_mount (config, mount);
-    ret = add_authenticated_listener (mount, mountinfo, client);
-    config_release_config();
-    auth_user->client = NULL;
-
-    return ret;
-}
-
-
-/* Decide whether we need to start a source or just process a source
- * admin request.
- */
-void auth_postprocess_source (auth_client *auth_user)
-{
-    client_t *client = auth_user->client;
-    const char *mount = auth_user->mount;
-    const char *req = httpp_getvar (client->parser, HTTPP_VAR_URI);
-
-    auth_user->client = NULL;
-    if (strcmp (req, "/admin.cgi") == 0 || strncmp ("/admin/metadata", req, 15) == 0)
-    {
-        DEBUG2 ("metadata request (%s, %s)", req, mount);
-        client->mount = mount;
-        client->aux_data = (int64_t)strdup("metadata");
-        admin_mount_request (client);
-    }
-    else
-    {
-        DEBUG1 ("on mountpoint %s", mount);
-        source_startup (client, mount);
-    }
-}
-
-
-/* Add a listener. Check for any mount information that states any
- * authentication to be used.
- */
-int auth_add_listener (const char *mount, client_t *client)
-{
-    int ret = 0, need_auth = 1;
-    ice_config_t *config = config_get_config();
-    mount_proxy *mountinfo = config_find_mount (config, mount);
-
-    if (client->flags & CLIENT_AUTHENTICATED)
-        need_auth = 0;
-    else
-    {
-        const char *range = httpp_getvar (client->parser, "range");
-        if (range)
-        {
-            uint64_t pos1 = 0, pos2 = (uint64_t)-1;
-
-            if (strncmp (range, "bytes=", 6) == 0)
-            {
-                if (sscanf (range+6, "-%" SCNuMAX, &pos2) < 1)
-                    if (sscanf (range+6, "%" SCNuMAX "-%" SCNuMAX, &pos1, &pos2) < 1)
-                        pos2 = 0;
-            }
-            else
-            {
-                INFO2 ("range header \"%.50s\" from %s", range, &client->connection.ip[0]);
-                pos2 = 0;
-            }
-
-            if (pos2 >= 0 && pos1 <= pos2)
-            {
-                client->intro_offset = pos1;
-                client->connection.discon.offset = pos2;
-                client->flags |= CLIENT_RANGE_END;
-                if (pos2 - pos1 < 100)
-                    need_auth = 0; // avoid auth check if range is very small, player hack
-            }
-            else
-                WARN2 ("client range invalid (%" PRIu64 ", %" PRIu64 "), ignoring", pos1, pos2);
-        }
-    }
-    if (client->parser->req_type == httpp_req_head)
-    {
-        client->flags &= ~CLIENT_AUTHENTICATED;
-        need_auth = 0;
+    if (client->auth && client->auth->release_client) {
+        auth_client *auth_user = auth_client_setup(client);
+        auth_user->process = auth_remove_client;
+        auth_user->on_result = __auth_on_result_destroy_client;
+        queue_auth_client(auth_user);
+        return 1;
+    } else if (client->auth) {
+        auth_release(client->auth);
+        client->auth = NULL;
     }
 
-    if (need_auth)
-    {
-        if (mountinfo)
-        {
-            auth_t *auth = mountinfo->auth;
-
-            if (mountinfo->skip_accesslog)
-                client->flags |= CLIENT_SKIP_ACCESSLOG;
-            if (mountinfo->ban_client)
-            {
-                if (mountinfo->ban_client < 0)
-                    client->flags |= CLIENT_IP_BAN_LIFT;
-                connection_add_banned_ip (client->connection.ip, mountinfo->ban_client);
-            }
-            if (mountinfo->no_mount)
-            {
-                config_release_config ();
-                return client_send_403 (client, "mountpoint unavailable");
-            }
-            if (mountinfo->redirect)
-            {
-                char buffer [4096] = "";
-                unsigned int len = sizeof buffer;
-
-                if (util_expand_pattern (mount, mountinfo->redirect, buffer, &len) == 0)
-                {
-                    config_release_config ();
-                    return client_send_302 (client, buffer);
-                }
-                WARN3 ("failed to expand %s on %s for %s", mountinfo->redirect, mountinfo->mountname, mount);
-                return client_send_501 (client);
-            }
-            do
-            {
-                if (auth == NULL) break;
-                if ((auth->flags & AUTH_RUNNING) == 0) break;
-                if (auth->pending_count > 400)
-                {
-                    if (auth->flags & AUTH_SKIP_IF_SLOW) break;
-                    config_release_config ();
-                    WARN0 ("too many clients awaiting authentication");
-                    if (global.new_connections_slowdown < 10)
-                        global.new_connections_slowdown++;
-                    return client_send_403 (client, "busy, please try again later");
-                }
-                if (auth->authenticate)
-                {
-                    auth_client *auth_user = auth_client_setup (mount, client);
-                    auth_user->process = auth_new_listener;
-                    client->flags &= ~CLIENT_ACTIVE;
-                    DEBUG1 ("adding client #%" PRIu64 " for authentication", client->connection.id);
-                    queue_auth_client (auth_user, mountinfo);
-                    config_release_config ();
-                    return 0;
-                }
-            } while (0);
-        }
-        else
-        {
-            if (strcmp (mount, "/admin/streams") == 0)
-            {
-                config_release_config ();
-                return client_send_401 (client, NULL);
-            }
-        }
-    }
-    ret = add_authenticated_listener (mount, mountinfo, client);
-    config_release_config ();
-    return ret;
-}
-
-
-/* General listener client shutdown function. Here we free up the passed client but
- * if the client is authenticated and there's auth available then queue it.
- */
-int auth_release_listener (client_t *client, const char *mount, mount_proxy *mountinfo)
-{
-    if (client->flags & CLIENT_AUTHENTICATED)
-    {
-        client_set_queue (client, NULL);
-
-        if (mount && mountinfo && mountinfo->auth && mountinfo->auth->release_listener)
-        {
-            auth_client *auth_user = auth_client_setup (mount, client);
-            client->flags &= ~CLIENT_ACTIVE;
-            if (client->worker)
-                client->ops = &auth_release_ops; // put into a wait state
-            auth_user->process = auth_remove_listener;
-            queue_auth_client (auth_user, mountinfo);
-            return 0;
-        }
-        client->flags &= ~CLIENT_AUTHENTICATED;
-    }
-    return client_send_404 (client, NULL);
+    acl_release(client->acl);
+    client->acl = NULL;
+    return 0;
 }
 
 
@@ -738,262 +564,716 @@ static int get_authenticator (auth_t *auth, config_options_t *options)
 {
     if (auth->type == NULL)
     {
-        WARN0 ("no authentication type defined");
+        ICECAST_LOG_WARN("no authentication type defined");
         return -1;
     }
     do
     {
-        DEBUG1 ("type is %s", auth->type);
+        ICECAST_LOG_DDEBUG("type is %s", auth->type);
 
-        if (strcmp (auth->type, "url") == 0)
-        {
-#ifdef HAVE_AUTH_URL
-            if (auth_get_url_auth (auth, options) < 0)
+        if (strcmp(auth->type, AUTH_TYPE_URL) == 0) {
+#ifdef HAVE_CURL
+            if (auth_get_url_auth(auth, options) < 0)
                 return -1;
             break;
 #else
-            ERROR0 ("Auth URL disabled, no libcurl support");
+            ICECAST_LOG_ERROR("Auth URL disabled");
             return -1;
 #endif
-        }
-        if (strcmp (auth->type, "command") == 0)
-        {
-#ifdef WIN32
-            ERROR1("Authenticator type: \"%s\" not supported on win32 platform", auth->type);
-            return -1;
-#else
-            if (auth_get_cmd_auth (auth, options) < 0)
+        } else if (strcmp(auth->type, AUTH_TYPE_HTPASSWD) == 0) {
+            if (auth_get_htpasswd_auth(auth, options) < 0)
                 return -1;
             break;
-#endif
-        }
-        if (strcmp (auth->type, "htpasswd") == 0)
-        {
-            if (auth_get_htpasswd_auth (auth, options) < 0)
+        } else if (strcmp(auth->type, AUTH_TYPE_ANONYMOUS) == 0) {
+            if (auth_get_anonymous_auth(auth, options) < 0)
+                return -1;
+            break;
+        } else if (strcmp(auth->type, AUTH_TYPE_STATIC) == 0) {
+            if (auth_get_static_auth(auth, options) < 0)
+                return -1;
+            break;
+        } else if (strcmp(auth->type, AUTH_TYPE_LEGACY_PASSWORD) == 0) {
+            if (auth_get_static_auth(auth, options) < 0)
+                return -1;
+            break;
+        } else if (strcmp(auth->type, AUTH_TYPE_ENFORCE_AUTH) == 0) {
+            if (auth_get_enforce_auth_auth(auth, options) < 0)
                 return -1;
             break;
         }
 
-        ERROR1("Unrecognised authenticator type: \"%s\"", auth->type);
+        ICECAST_LOG_ERROR("Unrecognised authenticator type: \"%s\"", auth->type);
         return -1;
     } while (0);
 
-    while (options)
-    {
-        if (strcmp (options->name, "allow_duplicate_users") == 0)
-            auth->flags |= atoi (options->value) ? AUTH_ALLOW_LISTENER_DUP : 0;
-        else if (strcmp(options->name, "realm") == 0)
-            auth->realm = (char*)xmlStrdup (XMLSTR(options->value));
-        else if (strcmp(options->name, "drop_existing_listener") == 0)
-            auth->flags |= atoi (options->value) ? AUTH_DEL_EXISTING_LISTENER : 0;
-        else if (strcmp (options->name, "rejected_mount") == 0)
-            auth->rejected_mount = (char*)xmlStrdup (XMLSTR(options->value));
-        else if (strcmp(options->name, "handlers") == 0)
-            auth->handlers = atoi (options->value);
-        options = options->next;
-    }
-    if (auth->handlers < 1) auth->handlers = 3;
-    if (auth->handlers > 100) auth->handlers = 100;
     return 0;
 }
 
 
-int auth_get_authenticator (xmlNodePtr node, void *x)
+static inline void auth_get_authenticator__filter_admin(auth_t *auth, xmlNodePtr node, size_t *filter_admin_index, const char *name, auth_matchtype_t matchtype)
 {
-    auth_t *auth = calloc (1, sizeof (auth_t));
+    char * tmp = (char*)xmlGetProp(node, XMLSTR(name));
+
+    if (tmp) {
+        char *cur = tmp;
+        char *next;
+
+        while (cur) {
+            next = strstr(cur, ",");
+            if (next) {
+                *next = 0;
+                next++;
+                for (; *next == ' '; next++);
+            }
+
+            if (*filter_admin_index < (sizeof(auth->filter_admin)/sizeof(*(auth->filter_admin)))) {
+                auth->filter_admin[*filter_admin_index].command = admin_get_command(cur);
+                switch (auth->filter_admin[*filter_admin_index].command) {
+                    case ADMIN_COMMAND_ERROR:
+                        ICECAST_LOG_ERROR("Can not add unknown %s command to role.", name);
+                    break;
+                    case ADMIN_COMMAND_ANY:
+                        auth->filter_admin_policy = matchtype;
+                    break;
+                    default:
+                        auth->filter_admin[*filter_admin_index].type = matchtype;
+                        (*filter_admin_index)++;
+                    break;
+                }
+            } else {
+                ICECAST_LOG_ERROR("Can not add more %s commands to role.", name);
+            }
+
+            cur = next;
+        }
+
+        free(tmp);
+    }
+}
+
+static inline void auth_get_authenticator__filter_origin(auth_t *auth, xmlNodePtr node, const char *name, auth_matchtype_t matchtype)
+{
+    char * tmp = (char*)xmlGetProp(node, XMLSTR(name));
+
+    if (tmp) {
+        char *cur = tmp;
+        char *next;
+
+        while (cur) {
+            next = strstr(cur, ",");
+            if (next) {
+                *next = 0;
+                next++;
+                for (; *next == ' '; next++);
+            }
+
+            if (strcmp(cur, "*") == 0) {
+                auth->filter_origin_policy = matchtype;
+            } else {
+                void *n = realloc(auth->filter_origin, (auth->filter_origin_len + 1)*sizeof(*auth->filter_origin));
+                if (!n) {
+                    ICECAST_LOG_ERROR("Can not allocate memory. BAD.");
+                    break;
+                }
+
+                auth->filter_origin = n;
+                auth->filter_origin[auth->filter_origin_len].type = matchtype;
+                auth->filter_origin[auth->filter_origin_len].origin = strdup(cur);
+                if (auth->filter_origin[auth->filter_origin_len].origin) {
+                    auth->filter_origin_len++;
+                } else {
+                    ICECAST_LOG_ERROR("Can not allocate memory. BAD.");
+                    break;
+                }
+            }
+
+            cur = next;
+        }
+
+        free(tmp);
+    }
+}
+
+static inline void auth_get_authenticator__init_method(auth_t *auth, int *method_inited, auth_matchtype_t init_with)
+{
+    size_t i;
+
+    if (*method_inited)
+        return;
+
+    for (i = 0; i < (sizeof(auth->filter_method)/sizeof(*auth->filter_method)); i++)
+        auth->filter_method[i] = init_with;
+
+    *method_inited = 1;
+}
+
+static inline int auth_get_authenticator__filter_method(auth_t *auth, xmlNodePtr node, const char *name, auth_matchtype_t matchtype, int *method_inited, auth_matchtype_t init_with)
+{
+    char * tmp = (char*)xmlGetProp(node, XMLSTR(name));
+
+    if (tmp) {
+        char *cur = tmp;
+
+        auth_get_authenticator__init_method(auth, method_inited, init_with);
+
+        while (cur) {
+            char *next = strstr(cur, ",");
+            httpp_request_type_e idx;
+
+            if (next) {
+                *next = 0;
+                next++;
+                for (; *next == ' '; next++);
+            }
+
+            if (strcmp(cur, "*") == 0) {
+                size_t i;
+
+                for (i = 0; i < (sizeof(auth->filter_method)/sizeof(*(auth->filter_method))); i++)
+                    auth->filter_method[i] = matchtype;
+                break;
+            }
+
+            idx = httpp_str_to_method(cur);
+            if (idx == httpp_req_unknown) {
+                ICECAST_LOG_ERROR("Can not add known method \"%H\" to role's %s", cur, name);
+                return -1;
+            }
+            auth->filter_method[idx] = matchtype;
+            cur = next;
+        }
+
+        free(tmp);
+    }
+
+    return 0;
+}
+
+static inline int auth_get_authenticator__permission_alter(auth_t *auth, xmlNodePtr node, const char *name, auth_matchtype_t matchtype)
+{
+    char * tmp = (char*)xmlGetProp(node, XMLSTR(name));
+
+    if (tmp) {
+        char *cur = tmp;
+
+        while (cur) {
+            char *next = strstr(cur, ",");
+            auth_alter_t idx;
+
+            if (next) {
+                *next = 0;
+                next++;
+                for (; *next == ' '; next++);
+            }
+
+            if (strcmp(cur, "*") == 0) {
+                size_t i;
+
+                for (i = 0; i < (sizeof(auth->permission_alter)/sizeof(*(auth->permission_alter))); i++)
+                    auth->permission_alter[i] = matchtype;
+                break;
+            }
+
+            idx = auth_str2alter(cur);
+            if (idx == AUTH_ALTER_NOOP) {
+                ICECAST_LOG_ERROR("Can not add unknown alter action \"%H\" to role's %s", cur, name);
+                return -1;
+            } else if (idx == AUTH_ALTER_REDIRECT) {
+                auth->permission_alter[AUTH_ALTER_REDIRECT] = matchtype;
+                auth->permission_alter[AUTH_ALTER_REDIRECT_SEE_OTHER] = matchtype;
+                auth->permission_alter[AUTH_ALTER_REDIRECT_TEMPORARY] = matchtype;
+                auth->permission_alter[AUTH_ALTER_REDIRECT_PERMANENT] = matchtype;
+            } else {
+                auth->permission_alter[idx] = matchtype;
+            }
+
+            cur = next;
+        }
+
+        free(tmp);
+    }
+
+    return 0;
+}
+auth_t *auth_get_authenticator(ice_config_t *configuration, xmlNodePtr node)
+{
+    auth_t *auth = calloc(1, sizeof(auth_t));
     config_options_t *options = NULL, **next_option = &options;
-    xmlNodePtr option;
-    int i;
+    xmlNodePtr child;
+    char *method;
+    char *tmp;
+    size_t i;
+    size_t filter_admin_index = 0;
+    int method_inited = 0;
 
     if (auth == NULL)
-        return -1;
+        return NULL;
 
-    option = node->xmlChildrenNode;
-    while (option)
-    {
-        xmlNodePtr current = option;
-        option = option->next;
-        if (xmlStrcmp (current->name, XMLSTR("option")) == 0)
-        {
-            config_options_t *opt = calloc (1, sizeof (config_options_t));
-            opt->name = (char *)xmlGetProp (current, XMLSTR("name"));
-            if (opt->name == NULL)
-            {
+    thread_mutex_create(&auth->lock);
+    auth->refcount = 1;
+    auth->id = _next_auth_id();
+    auth->type = (char*)xmlGetProp(node, XMLSTR("type"));
+    auth->role = (char*)xmlGetProp(node, XMLSTR("name"));
+    auth->management_url = (char*)xmlGetProp(node, XMLSTR("management-url"));
+    auth->filter_web_policy = AUTH_MATCHTYPE_MATCH;
+    auth->filter_admin_policy = AUTH_MATCHTYPE_MATCH;
+    auth->failed_arg = AUTH_ALTER_NOOP;
+    auth->deny_arg = AUTH_ALTER_NOOP;
+
+    for (i = 0; i < (sizeof(auth->filter_admin)/sizeof(*(auth->filter_admin))); i++) {
+        auth->filter_admin[i].type = AUTH_MATCHTYPE_UNUSED;
+        auth->filter_admin[i].command = ADMIN_COMMAND_ERROR;
+    }
+
+    for (i = 0; i < (sizeof(auth->permission_alter)/sizeof(*(auth->permission_alter))); i++)
+        auth->permission_alter[i] = AUTH_MATCHTYPE_NOMATCH;
+
+    if (!auth->type) {
+        auth_release(auth);
+        return NULL;
+    }
+
+    method = (char*)xmlGetProp(node, XMLSTR("method"));
+    if (method) {
+        char *cur = method;
+        char *next;
+
+        for (i = 0; i < (sizeof(auth->filter_method)/sizeof(*auth->filter_method)); i++)
+            auth->filter_method[i] = AUTH_MATCHTYPE_NOMATCH;
+        method_inited = 1;
+
+        while (cur) {
+            httpp_request_type_e idx;
+
+            next = strstr(cur, ",");
+            if (next) {
+                *next = 0;
+                next++;
+                for (; *next == ' '; next++);
+            }
+
+            if (strcmp(cur, "*") == 0) {
+                for (i = 0; i < (sizeof(auth->filter_method)/sizeof(*auth->filter_method)); i++)
+                    auth->filter_method[i] = AUTH_MATCHTYPE_MATCH;
+                break;
+            }
+
+            idx = httpp_str_to_method(cur);
+            if (idx == httpp_req_unknown) {
+                auth_release(auth);
+                return NULL;
+            }
+            auth->filter_method[idx] = AUTH_MATCHTYPE_MATCH;
+
+            cur = next;
+        }
+
+        xmlFree(method);
+    }
+
+    auth_get_authenticator__filter_method(auth, node, "match-method", AUTH_MATCHTYPE_MATCH, &method_inited, AUTH_MATCHTYPE_NOMATCH);
+    auth_get_authenticator__filter_method(auth, node, "nomatch-method", AUTH_MATCHTYPE_NOMATCH, &method_inited, AUTH_MATCHTYPE_MATCH);
+
+    auth_get_authenticator__init_method(auth, &method_inited, AUTH_MATCHTYPE_MATCH);
+
+    tmp = (char*)xmlGetProp(node, XMLSTR("match-web"));
+    if (tmp) {
+        if (strcmp(tmp, "*") == 0) {
+            auth->filter_web_policy = AUTH_MATCHTYPE_MATCH;
+        } else {
+            auth->filter_web_policy = AUTH_MATCHTYPE_NOMATCH;
+        }
+        free(tmp);
+    }
+
+    tmp = (char*)xmlGetProp(node, XMLSTR("nomatch-web"));
+    if (tmp) {
+        if (strcmp(tmp, "*") == 0) {
+            auth->filter_web_policy = AUTH_MATCHTYPE_NOMATCH;
+        } else {
+            auth->filter_web_policy = AUTH_MATCHTYPE_MATCH;
+        }
+        free(tmp);
+    }
+
+    auth_get_authenticator__filter_admin(auth, node, &filter_admin_index, "match-admin", AUTH_MATCHTYPE_MATCH);
+    auth_get_authenticator__filter_admin(auth, node, &filter_admin_index, "nomatch-admin", AUTH_MATCHTYPE_NOMATCH);
+
+    auth->filter_origin_policy = AUTH_MATCHTYPE_MATCH;
+    auth_get_authenticator__filter_origin(auth, node, "match-origin", AUTH_MATCHTYPE_MATCH);
+    auth_get_authenticator__filter_origin(auth, node, "nomatch-origin", AUTH_MATCHTYPE_NOMATCH);
+
+    auth_get_authenticator__permission_alter(auth, node, "may-alter", AUTH_MATCHTYPE_MATCH);
+    auth_get_authenticator__permission_alter(auth, node, "may-not-alter", AUTH_MATCHTYPE_NOMATCH);
+
+    /* sub node parsing */
+    child = node->xmlChildrenNode;
+    do {
+        if (child == NULL)
+            break;
+
+        if (xmlIsBlankNode(child))
+            continue;
+
+        if (xmlStrcmp (child->name, XMLSTR("option")) == 0) {
+            config_options_t *opt = calloc(1, sizeof (config_options_t));
+            opt->name = (char *)xmlGetProp(child, XMLSTR("name"));
+            if (opt->name == NULL) {
                 free(opt);
                 continue;
             }
-            opt->value = (char *)xmlGetProp (current, XMLSTR("value"));
-            if (opt->value == NULL)
-            {
-                xmlFree (opt->name);
-                free (opt);
+            opt->value = (char *)xmlGetProp(child, XMLSTR("value"));
+            if (opt->value == NULL) {
+                xmlFree(opt->name);
+                free(opt);
                 continue;
             }
             *next_option = opt;
             next_option = &opt->next;
+        } else if (xmlStrcmp (child->name, XMLSTR("http-headers")) == 0) {
+            config_parse_http_headers(child->xmlChildrenNode, &(auth->http_headers), configuration);
+        } else if (xmlStrcmp (child->name, XMLSTR("acl")) == 0) {
+            if (!auth->acl) {
+                auth->acl  = acl_new_from_xml_node(configuration, child);
+            } else {
+                ICECAST_LOG_ERROR("More than one ACL defined in role! Not supported (yet).");
+            }
+        } else if (xmlStrcmp (child->name, XMLSTR("on-failed-action")) == 0) {
+            tmp = (char *)xmlNodeListGetString(child->doc, child->xmlChildrenNode, 1);
+            if (tmp) {
+                auth->failed_action = auth_str2alter(tmp);
+                if (auth->failed_action == AUTH_ALTER_NOOP) {
+                    ICECAST_LOG_WARN("Can not parse <on-failed-action> with value: %s", tmp);
+                }
+                xmlFree(tmp);
+            }
+        } else if (xmlStrcmp (child->name, XMLSTR("on-failed-argument")) == 0) {
+            if (auth->failed_arg)
+                xmlFree(auth->failed_arg);
+            auth->failed_arg = (char *)xmlNodeListGetString(child->doc, child->xmlChildrenNode, 1);
+        } else if (xmlStrcmp (child->name, XMLSTR("on-deny-action")) == 0) {
+            tmp = (char *)xmlNodeListGetString(child->doc, child->xmlChildrenNode, 1);
+            if (tmp) {
+                auth->deny_action = auth_str2alter(tmp);
+                if (auth->deny_action == AUTH_ALTER_NOOP) {
+                    ICECAST_LOG_WARN("Can not parse <on-deny-action> with value: %s", tmp);
+                }
+                xmlFree(tmp);
+            }
+        } else if (xmlStrcmp (child->name, XMLSTR("on-deny-argument")) == 0) {
+            if (auth->deny_arg)
+                xmlFree(auth->deny_arg);
+            auth->deny_arg = (char *)xmlNodeListGetString(child->doc, child->xmlChildrenNode, 1);
+        } else {
+            ICECAST_LOG_WARN("unknown auth setting (%H)", child->name);
         }
-        else
-            if (xmlStrcmp (current->name, XMLSTR("text")) != 0)
-                WARN1 ("unknown auth setting (%s)", current->name);
+    } while ((child = child->next));
+
+    if (!auth->acl) {
+        /* If we did not get a <acl> try ACL as part of <role> (old style). */
+        auth->acl  = acl_new_from_xml_node(configuration, node);
     }
-    auth->type = (char *)xmlGetProp (node, XMLSTR("type"));
-    if (get_authenticator (auth, options) < 0)
-    {
-        xmlFree (auth->type);
-        free (auth);
+    if (!auth->acl) {
+        auth_release(auth);
         auth = NULL;
-    }
-    else
-    {
-        auth->tailp = &auth->head;
-        thread_mutex_create (&auth->lock);
-
-        /* allocate N threads */
-        auth->handles = calloc (auth->handlers, sizeof (auth_thread_t));
-        auth->refcount = 1;
-        auth->flags |= (AUTH_RUNNING|AUTH_CLEAN_ENV);
-        for (i=0; i<auth->handlers; i++)
-        {
-            if (auth->alloc_thread_data)
-                auth->handles[i].data = auth->alloc_thread_data (auth);
-            auth->handles[i].id = thread_id++;
-            auth->handles[i].auth = auth;
+    } else {
+        if (get_authenticator (auth, options) < 0) {
+            auth_release(auth);
+            auth = NULL;
+        } else {
+            auth->tailp = &auth->head;
+            if (!auth->immediate) {
+                auth->running = 1;
+                auth->thread = thread_create("auth thread", auth_run_thread, auth, THREAD_ATTACHED);
+            }
         }
-        *(auth_t**)x = auth;
     }
 
-    while (options)
-    {
+    while (options) {
         config_options_t *opt = options;
         options = opt->next;
-        xmlFree (opt->name);
-        xmlFree (opt->value);
+        xmlFree(opt->name);
+        xmlFree(opt->value);
         free (opt);
     }
+
+    if (auth && !auth->management_url && (auth->adduser || auth->deleteuser || auth->listuser)) {
+        char url[128];
+        snprintf(url, sizeof(url), "/admin/manageauth.xsl?id=%lu", auth->id);
+        auth->management_url = (char*)xmlCharStrdup(url);
+    }
+
+    return auth;
+}
+
+int auth_alter_client(auth_t *auth, auth_client *auth_user, auth_alter_t action, const char *arg)
+{
+    if (!auth || !auth_user || !arg)
+        return -1;
+
+    if (action < 0 || action >= (sizeof(auth->permission_alter)/sizeof(*(auth->permission_alter))))
+        return -1;
+
+    if (auth->permission_alter[action] != AUTH_MATCHTYPE_MATCH)
+        return -1;
+
+    if (util_replace_string(&(auth_user->alter_client_arg), arg) != 0)
+        return -1;
+
+    auth_user->alter_client_action = action;
+
     return 0;
 }
 
-
-/* Called when a source client connects and requires authentication via the
- * authenticator. This is called for both source clients and admin requests
- * that work on a specified mountpoint.
- */
-int auth_stream_authenticate (client_t *client, const char *mount, mount_proxy *mountinfo)
+auth_alter_t auth_str2alter(const char *str)
 {
-    if (mountinfo && mountinfo->auth && mountinfo->auth->stream_auth)
-    {
-        auth_client *auth_user = auth_client_setup (mount, client);
+    if (!str)
+        return AUTH_ALTER_NOOP;
 
-        auth_user->process = stream_auth_callback;
-        INFO1 ("request source auth for \"%s\"", mount);
-        client->flags &= ~CLIENT_ACTIVE;
-        queue_auth_client (auth_user, mountinfo);
-        return 1;
-    }
-    return 0;
-}
-
-
-/* called when the stream starts, so that authentication engine can do any
- * cleanup/initialisation.
- */
-void auth_stream_start (mount_proxy *mountinfo, source_t *source)
-{
-    if (mountinfo && mountinfo->auth && mountinfo->auth->stream_start)
-    {
-        client_t *client = source->client;
-        const char *agent = httpp_getvar (client->parser, "user-agent"),
-                   *mount = source->mount;
-        auth_client *auth_user = auth_client_setup (mount, NULL);
-
-        auth_user->process = stream_start_callback;
-
-        // use a blank client copy to avoid a race as slower callbacks could occur
-        // after a short lived source.
-        auth_user->client = calloc (1, sizeof (client_t));
-        auth_user->client->connection.ip = strdup (client->connection.ip);
-        if (agent)
-            auth_user->client->shared_data = strdup (agent);
-        INFO1 ("request stream startup for \"%s\"", mount);
-
-        queue_auth_client (auth_user, mountinfo);
+    if (strcasecmp(str, "noop") == 0) {
+        return AUTH_ALTER_NOOP;
+    } else if (strcasecmp(str, "rewrite") == 0) {
+        return AUTH_ALTER_REWRITE;
+    } else if (strcasecmp(str, "redirect") == 0) {
+        return AUTH_ALTER_REDIRECT;
+    } else if (strcasecmp(str, "redirect_see_other") == 0) {
+        return AUTH_ALTER_REDIRECT_SEE_OTHER;
+    } else if (strcasecmp(str, "redirect_temporary") == 0) {
+        return AUTH_ALTER_REDIRECT_TEMPORARY;
+    } else if (strcasecmp(str, "redirect_permanent") == 0) {
+        return AUTH_ALTER_REDIRECT_PERMANENT;
+    } else if (strcasecmp(str, "send_error") == 0) {
+        return AUTH_ALTER_SEND_ERROR;
+    } else {
+        return AUTH_ALTER_NOOP;
     }
 }
-
-
-/* Called when the stream ends so that the authentication engine can do
- * any authentication cleanup
- */
-void auth_stream_end (mount_proxy *mountinfo, source_t *source)
-{
-    if (mountinfo && mountinfo->auth && mountinfo->auth->stream_end)
-    {
-        client_t *client = source->client;
-        const char *agent = httpp_getvar (client->parser, "user-agent"),
-                           *mount = source->mount;
-        auth_client *auth_user = auth_client_setup (mount, NULL);
-
-        // use a blank client copy to avoid a race
-        auth_user->client = calloc (1, sizeof (client_t));
-        auth_user->client->connection.ip = strdup (client->connection.ip);
-        if (agent)
-            auth_user->client->shared_data = strdup (agent);
-        auth_user->process = stream_end_callback;
-        INFO1 ("request stream end for \"%s\"", mount);
-
-        queue_auth_client (auth_user, mountinfo);
-    }
-}
-
-
-/* return -1 for failed, 0 for authenticated, 1 for pending
- */
-int auth_check_source (client_t *client, const char *mount)
-{
-    ice_config_t *config = config_get_config();
-    char *pass = config->source_password;
-    char *user = "source";
-    int ret = -1;
-    mount_proxy *mountinfo = config_find_mount (config, mount);
-
-    do
-    {
-        if (mountinfo)
-        {
-            ret = 1;
-            if (auth_stream_authenticate (client, mount, mountinfo) > 0)
-                break;
-            ret = -1;
-            if (mountinfo->password)
-                pass = mountinfo->password;
-            if (mountinfo->username && client->server_conn->shoutcast_compat == 0)
-                user = mountinfo->username;
-        }
-        if (connection_check_pass (client->parser, user, pass) > 0)
-            ret = 0;
-    } while (0);
-    config_release_config();
-    return ret;
-}
-
 
 /* these are called at server start and termination */
 
 void auth_initialise (void)
 {
-    thread_rwlock_create (&auth_lock);
-    thread_id = 0;
-    allow_auth = 1;
+    thread_mutex_create(&_auth_lock);
 }
 
 void auth_shutdown (void)
 {
-    if (allow_auth == 0)
-        return;
-    allow_auth = 0;
-    thread_rwlock_wlock (&auth_lock);
-    thread_rwlock_unlock (&auth_lock);
-    thread_rwlock_destroy (&auth_lock);
-    INFO0 ("Auth shutdown complete");
+    ICECAST_LOG_INFO("Auth shutdown");
+    thread_mutex_destroy(&_auth_lock);
 }
 
+/* authstack functions */
+
+static void __move_client_forward_in_auth_stack(client_t *client, void (*on_result)(client_t *client, void *userdata, auth_result result), void *userdata) {
+    auth_stack_next(&client->authstack);
+    if (client->authstack) {
+        auth_stack_add_client(client->authstack, client, on_result, userdata);
+    } else {
+        if (on_result)
+            on_result(client, userdata, AUTH_NOMATCH);
+    }
+}
+
+void          auth_stack_add_client(auth_stack_t *stack, client_t *client, void (*on_result)(client_t *client, void *userdata, auth_result result), void *userdata) {
+    auth_t *auth;
+
+    if (!stack || !client || (client->authstack && client->authstack != stack))
+        return;
+
+    if (!client->authstack)
+        auth_stack_addref(stack);
+    client->authstack = stack;
+    auth = auth_stack_get(stack);
+    auth_add_client(auth, client, __move_client_forward_in_auth_stack, on_result, userdata);
+    auth_release(auth);
+}
+
+void          auth_stack_release(auth_stack_t *stack) {
+    if (!stack)
+        return;
+
+    thread_mutex_lock(&stack->lock);
+    stack->refcount--;
+    thread_mutex_unlock(&stack->lock);
+
+    if (stack->refcount)
+        return;
+
+    auth_release(stack->auth);
+    auth_stack_release(stack->next);
+    thread_mutex_destroy(&stack->lock);
+    free(stack);
+}
+
+void          auth_stack_addref(auth_stack_t *stack) {
+    if (!stack)
+        return;
+    thread_mutex_lock(&stack->lock);
+    stack->refcount++;
+    thread_mutex_unlock(&stack->lock);
+}
+
+int           auth_stack_next(auth_stack_t **stack) {
+    auth_stack_t *next;
+    if (!stack || !*stack)
+        return -1;
+    thread_mutex_lock(&(*stack)->lock);
+    next = (*stack)->next;
+    auth_stack_addref(next);
+    thread_mutex_unlock(&(*stack)->lock);
+    auth_stack_release(*stack);
+    *stack = next;
+    if (!next)
+        return 1;
+    return 0;
+}
+
+int           auth_stack_push(auth_stack_t **stack, auth_t *auth) {
+    auth_stack_t *next;
+
+    if (!stack || !auth)
+        return -1;
+
+    next = calloc(1, sizeof(*next));
+    if (!next) {
+        return -1;
+    }
+    thread_mutex_create(&next->lock);
+    next->refcount = 1;
+    next->auth = auth;
+    auth_addref(auth);
+
+    if (*stack) {
+        auth_stack_append(*stack, next);
+        auth_stack_release(next);
+        return 0;
+    } else {
+        *stack = next;
+        return 0;
+    }
+}
+
+int           auth_stack_append(auth_stack_t *stack, auth_stack_t *tail) {
+    auth_stack_t *next, *cur;
+
+    if (!stack)
+        return -1;
+
+    auth_stack_addref(cur = stack);
+    thread_mutex_lock(&cur->lock);
+    while (1) {
+        next = cur->next;
+        if (!cur->next)
+            break;
+
+        auth_stack_addref(next);
+        thread_mutex_unlock(&cur->lock);
+        auth_stack_release(cur);
+        cur = next;
+        thread_mutex_lock(&cur->lock);
+    }
+
+    auth_stack_addref(cur->next = tail);
+    thread_mutex_unlock(&cur->lock);
+    auth_stack_release(cur);
+
+    return 0;
+}
+
+auth_t       *auth_stack_get(auth_stack_t *stack) {
+    auth_t *auth;
+
+    if (!stack)
+        return NULL;
+
+    thread_mutex_lock(&stack->lock);
+    auth_addref(auth = stack->auth);
+    thread_mutex_unlock(&stack->lock);
+    return auth;
+}
+
+auth_t       *auth_stack_getbyid(auth_stack_t *stack, unsigned long id) {
+    auth_t *ret = NULL;
+
+    if (!stack)
+        return NULL;
+
+    auth_stack_addref(stack);
+
+    while (!ret && stack) {
+        auth_t *auth = auth_stack_get(stack);
+        if (auth->id == id) {
+            ret = auth;
+            break;
+        }
+        auth_release(auth);
+        auth_stack_next(&stack);
+    }
+
+    if (stack)
+        auth_stack_release(stack);
+
+    return ret;
+
+}
+
+acl_t        *auth_stack_get_anonymous_acl(auth_stack_t *stack, httpp_request_type_e method) {
+    acl_t *ret = NULL;
+
+    if (!stack || method < 0 || method > httpp_req_unknown)
+        return NULL;
+
+    auth_stack_addref(stack);
+
+    while (!ret && stack) {
+        auth_t *auth = auth_stack_get(stack);
+        if (auth->filter_method[method] != AUTH_MATCHTYPE_NOMATCH && strcmp(auth->type, AUTH_TYPE_ANONYMOUS) == 0) {
+            acl_addref(ret = auth->acl);
+        }
+        auth_release(auth);
+
+        if (!ret)
+            auth_stack_next(&stack);
+    }
+
+    if (stack)
+        auth_stack_release(stack);
+
+    return ret;
+}
+
+
+static void          auth_reject_client(client_t *client, int fail)
+{
+    auth_t *auth;
+
+    if (!client)
+        return;
+
+    auth = client->auth;
+    if (auth) {
+        if (fail) {
+            if (__handle_auth_client_alter(client, auth->failed_action, auth->failed_arg) == 1)
+                return;
+        } else {
+            if (__handle_auth_client_alter(client, auth->deny_action, auth->deny_arg) == 1)
+                return;
+        }
+    }
+
+    if (client->protocol == ICECAST_PROTOCOL_SHOUTCAST) {
+        client_destroy(client);
+    } else {
+        client_send_error_by_id(client, ICECAST_ERROR_GEN_CLIENT_NEEDS_TO_AUTHENTICATE);
+    }
+}
+
+void          auth_reject_client_on_fail(client_t *client)
+{
+    auth_reject_client(client, 1);
+}
+
+void          auth_reject_client_on_deny(client_t *client)
+{
+    auth_reject_client(client, 0);
+}
